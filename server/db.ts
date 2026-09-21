@@ -258,7 +258,7 @@ export function initDatabase() {
     console.error('Migration note:', err);
   }
 
-  // Ensure Initial Admin Account: Login ID 9640488507 with hashed password saikiran@123
+  // Ensure Initial Admin Account: Login ID 9640488507 with hashed password 9640488507
   const targetLoginId = '9640488507';
   const existingAdmin = db.prepare("SELECT * FROM users WHERE login_id = ? OR username = ?").get(targetLoginId, targetLoginId) as any;
   const now = new Date().toISOString();
