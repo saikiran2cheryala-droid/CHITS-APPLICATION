@@ -1,0 +1,6 @@
+{
+  "name": "CHIT MANAGER",
+  "description": "Production-ready Chit Fund Management system for managing multiple chit groups, custom monthly rules, member allocations, lift payouts, monthly dues, and payment collections.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
