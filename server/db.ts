@@ -327,19 +327,75 @@ export function resetFailedLogins(userId: string) {
 }
 
 // Session Management
-export function createSession(userId: string, rawToken: string, ip?: string, ua?: string) {
+export function createSession(
+  userId: string,
+  rawToken: string,
+  ip?: string,
+  ua?: string
+) {
+  // Make sure the user exists before creating the session.
+  // This prevents SQLite FOREIGN KEY constraint errors.
+  const user = db
+    .prepare("SELECT id FROM users WHERE id = ? AND is_active = 1")
+    .get(userId) as any;
+
+  if (!user) {
+    console.error(
+      `SESSION ERROR: User not found or inactive. userId=${userId}`
+    );
+    throw new Error(
+      `Cannot create session: user ${userId} does not exist or is inactive`
+    );
+  }
+
   const tokenHash = hashToken(rawToken);
-  const id = 'sess-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex');
+
+  const id =
+    "sess-" +
+    Date.now() +
+    "-" +
+    crypto.randomBytes(8).toString("hex");
+
   const now = new Date().toISOString();
-  // 7 days expiration
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-  db.prepare(`
-    INSERT INTO sessions (id, user_id, session_token_hash, expires_at, created_at, last_used_at, ip_address, user_agent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, userId, tokenHash, expiresAt, now, now, ip || null, ua || null);
+  // Session expires after 7 days.
+  const expiresAt = new Date(
+    Date.now() + 7 * 24 * 60 * 60 * 1000
+  ).toISOString();
 
-  return { id, expiresAt };
+  try {
+    db.prepare(`
+      INSERT INTO sessions (
+        id,
+        user_id,
+        session_token_hash,
+        expires_at,
+        created_at,
+        last_used_at,
+        ip_address,
+        user_agent
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      user.id,
+      tokenHash,
+      expiresAt,
+      now,
+      now,
+      ip || null,
+      ua || null
+    );
+  } catch (error) {
+    console.error("SESSION INSERT ERROR:", error);
+    console.error("Session user ID:", user.id);
+    throw error;
+  }
+
+  return {
+    id,
+    expiresAt,
+  };
 }
 
 export function verifySessionToken(rawToken: string) {
