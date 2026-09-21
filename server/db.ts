@@ -264,7 +264,7 @@ export function initDatabase() {
   const now = new Date().toISOString();
 
   if (!existingAdmin) {
-    const { hash, salt } = hashPassword('saikiran@123');
+    const { hash, salt } = hashPassword('9640488507');
     db.prepare(`
       INSERT INTO users (
         id, login_id, username, password_hash, salt, name, role,
@@ -286,10 +286,10 @@ export function initDatabase() {
     );
     console.log(`Initial Admin created with Login ID: ${targetLoginId} (Password hashed securely).`);
   } else {
-    // If existingAdmin cannot be authenticated with saikiran@123, ensure saikiran@123 is valid
-    const isCurrentValid = verifyPassword('saikiran@123', existingAdmin.password_hash, existingAdmin.salt);
+    // If existingAdmin cannot be authenticated with 9640488507, ensure 9640488507 is valid
+    const isCurrentValid = verifyPassword('9640488507', existingAdmin.password_hash, existingAdmin.salt);
     if (!isCurrentValid) {
-      const { hash, salt } = hashPassword('saikiran@123');
+      const { hash, salt } = hashPassword('9640488507');
       db.prepare(`
         UPDATE users SET password_hash = ?, salt = ?, is_active = 1, failed_login_attempts = 0, locked_until = NULL, updated_at = ?
         WHERE id = ?
