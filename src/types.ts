@@ -11,6 +11,10 @@ export interface User {
   recovery_email?: string;
   recovery_phone?: string;
   is_active?: boolean;
+  password_changed_at?: string | null;
+  password_expires_at?: string | null;
+  is_password_expired?: boolean;
+  security_question?: string;
   created_at: string;
   updated_at?: string;
   last_login_at?: string;
@@ -115,6 +119,8 @@ export interface MonthlyDue {
   customer_name?: string;
   phone?: string;
   ticket_number?: string;
+  chit_name?: string;
+  chit_current_month?: number;
   lift_status?: 'not_lifted' | 'lifted';
   lift_month?: number | null;
 }

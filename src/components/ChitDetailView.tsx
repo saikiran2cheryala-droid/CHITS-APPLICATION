@@ -33,6 +33,7 @@ import { EditChitModal } from './EditChitModal';
 import { DeleteChitModal } from './DeleteChitModal';
 import { ImportCustomersModal } from './ImportCustomersModal';
 import { ImportLiftPayoutModal } from './ImportLiftPayoutModal';
+import { EditPaymentModal } from './EditPaymentModal';
 import { downloadLiftPayoutTemplate } from '../utils/payoutExcelImport';
 
 interface ChitDetailViewProps {
@@ -64,6 +65,10 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   // Month selector state for Monthly Sheet
   const [selectedMonth, setSelectedMonth] = useState<number>(1);
   const hasInitializedMonth = React.useRef(false);
+
+  useEffect(() => {
+    hasInitializedMonth.current = false;
+  }, [chitId]);
 
   // Edit and Delete Chit modals state
   const [isEditChitOpen, setIsEditChitOpen] = useState(false);
@@ -115,6 +120,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   // Filter & Search inside Monthly Sheet
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'PENDING' | 'PARTIAL' | 'PAID'>('ALL');
+  const [editingPaymentDue, setEditingPaymentDue] = useState<MonthlyDue | null>(null);
 
   // Reports state
   const [reportsData, setReportsData] = useState<any | null>(null);
@@ -167,13 +173,11 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   }, [chitId, refreshKey]);
 
   // Load Month Data
-  useEffect(() => {
+  const fetchMonthData = (m = selectedMonth) => {
     if (!chitId) return;
     setMonthLoading(true);
-    // Reset profit visibility to hidden whenever selected month changes
-    setShowProfit(false);
     api.monthView
-      .getData(chitId, selectedMonth)
+      .getData(chitId, m)
       .then((data) => {
         setMonthData(data);
       })
@@ -181,6 +185,12 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
         console.error('Failed to load month data', err);
       })
       .finally(() => setMonthLoading(false));
+  };
+
+  useEffect(() => {
+    // Reset profit visibility to hidden whenever selected month changes
+    setShowProfit(false);
+    fetchMonthData(selectedMonth);
   }, [chitId, selectedMonth, refreshKey]);
 
   // Load Reports when reports tab is clicked
@@ -696,7 +706,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                   <th className="py-3 px-3.5 text-right">Paid</th>
                   <th className="py-3 px-3.5 text-right">Balance</th>
                   <th className="py-3 px-3.5 text-center">Status</th>
-                  <th className="py-3 px-3.5 text-right">Action</th>
+                  <th className="py-3 px-3.5 text-right min-w-[200px]">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -778,30 +788,53 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                           </span>
                         </td>
                         <td className="py-3 px-3.5 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            {due.status !== 'PAID' ? (
+                          <div className="flex items-center justify-end gap-1.5 flex-nowrap">
+                            {/* Option 1: Receive Payment (if due has outstanding balance) */}
+                            {due.status !== 'PAID' && (
                               <button
                                 type="button"
+                                id={`action-receive-payment-btn-${due.member_id}`}
                                 onClick={() => onOpenPaymentModal(due)}
-                                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold shadow-xs transition-colors"
+                                className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                                title="Receive payment for this month"
                               >
-                                Record Pay
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => onOpenCustomerProfile(due.member_id)}
-                                className="px-2.5 py-1 text-slate-600 hover:text-slate-900 rounded-lg text-xs font-semibold bg-slate-100"
-                              >
-                                View
+                                <CreditCard className="w-3.5 h-3.5" />
+                                <span>Receive Pay</span>
                               </button>
                             )}
+
+                            {/* Option 2: Edit Payment (if any payment has been received for this due) */}
+                            {due.paid_amount > 0 && (
+                              <button
+                                type="button"
+                                id={`action-edit-payment-btn-${due.member_id}`}
+                                onClick={() => setEditingPaymentDue(due)}
+                                className="px-2.5 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 hover:border-blue-300 rounded-lg text-xs font-bold transition-all flex items-center gap-1 whitespace-nowrap cursor-pointer shadow-2xs"
+                                title="Edit received payment details (amount, mode, date, remarks, or delete)"
+                              >
+                                <Edit2 className="w-3 h-3" />
+                                <span>Edit Pay</span>
+                              </button>
+                            )}
+
+                            {/* Option 3: View Customer Profile */}
+                            <button
+                              type="button"
+                              id={`action-view-btn-${due.member_id}`}
+                              onClick={() => onOpenCustomerProfile(due.member_id)}
+                              className="px-2.5 py-1.5 text-slate-600 hover:text-slate-900 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                              title="View Customer Profile & History"
+                            >
+                              View
+                            </button>
+
+                            {/* Option 4: Lift Chit Award button if not yet lifted */}
                             {!isLifted && (
                               <button
                                 type="button"
                                 onClick={() => onOpenLiftModal(chit, selectedMonth, due.member_id)}
                                 title="Lift Chit for this member"
-                                className="p-1.5 text-purple-700 hover:bg-purple-50 rounded-lg"
+                                className="p-1.5 text-purple-700 hover:bg-purple-100 rounded-lg transition-colors cursor-pointer"
                               >
                                 <Award className="w-4 h-4" />
                               </button>
@@ -900,23 +933,35 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                       )}
                     </div>
 
-                    {due.status !== 'PAID' ? (
-                      <button
-                        type="button"
-                        onClick={() => onOpenPaymentModal(due)}
-                        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-xs"
-                      >
-                        Record Pay ({formatINR(due.balance_amount)})
-                      </button>
-                    ) : (
+                    <div className="flex items-center gap-2 flex-wrap pt-1">
+                      {due.status !== 'PAID' && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenPaymentModal(due)}
+                          className="flex-1 py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <CreditCard className="w-3.5 h-3.5" />
+                          <span>Receive Pay ({formatINR(due.balance_amount)})</span>
+                        </button>
+                      )}
+                      {due.paid_amount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setEditingPaymentDue(due)}
+                          className="py-2 px-3 bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1 cursor-pointer"
+                        >
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Edit Pay</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => onOpenCustomerProfile(due.member_id)}
-                        className="px-3 py-1.5 bg-slate-100 text-slate-700 text-xs font-bold rounded-xl"
+                        className="py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl cursor-pointer"
                       >
-                        Profile & History
+                        Profile
                       </button>
-                    )}
+                    </div>
                   </div>
                 </div>
               ))
@@ -1904,6 +1949,19 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
           return res;
         }}
       />
+
+      {/* Edit Received Payment Modal */}
+      {editingPaymentDue && (
+        <EditPaymentModal
+          due={editingPaymentDue}
+          onClose={() => setEditingPaymentDue(null)}
+          onSuccess={() => {
+            fetchMonthData(selectedMonth);
+            triggerRefresh();
+            setEditingPaymentDue(null);
+          }}
+        />
+      )}
     </div>
   );
 };

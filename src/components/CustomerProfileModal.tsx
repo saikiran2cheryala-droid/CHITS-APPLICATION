@@ -16,6 +16,7 @@ import {
 import { Member, MonthlyDue, Payment } from '../types';
 import { api } from '../services/api';
 import { formatINR, formatDate, formatDateTime, formatDDMMYYYY } from '../utils/formatters';
+import { EditPaymentModal } from './EditPaymentModal';
 
 interface CustomerProfileModalProps {
   memberId: string | null;
@@ -51,8 +52,10 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'schedule' | 'history'>('schedule');
+  const [editingPaymentDue, setEditingPaymentDue] = useState<MonthlyDue | null>(null);
+  const [editingPaymentRecord, setEditingPaymentRecord] = useState<Payment | null>(null);
 
-  useEffect(() => {
+  const fetchProfile = () => {
     if (!memberId) return;
     setLoading(true);
     setError(null);
@@ -67,6 +70,10 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
       .finally(() => {
         setLoading(false);
       });
+  };
+
+  useEffect(() => {
+    fetchProfile();
   }, [memberId]);
 
   if (!memberId) return null;
@@ -468,23 +475,38 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                               </span>
                             </td>
                             <td className="py-2.5 px-3 text-right">
-                              {due.status !== 'PAID' && onRecordPaymentClick && (
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    onRecordPaymentClick(due);
-                                    onClose();
-                                  }}
-                                  className="px-2.5 py-1 text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors cursor-pointer"
-                                >
-                                  Pay
-                                </button>
-                              )}
-                              {due.status === 'PAID' && (
-                                <span className="text-emerald-600 text-xs font-bold inline-flex items-center gap-1">
-                                  <CheckCircle className="w-3.5 h-3.5" />
-                                </span>
-                              )}
+                              <div className="flex items-center justify-end gap-1.5 flex-nowrap">
+                                {due.status !== 'PAID' && onRecordPaymentClick && (
+                                  <button
+                                    type="button"
+                                    id={`profile-receive-pay-btn-${due.id}`}
+                                    onClick={() => {
+                                      onRecordPaymentClick(due);
+                                      onClose();
+                                    }}
+                                    className="px-2.5 py-1 text-[11px] font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap"
+                                    title="Receive payment for this month"
+                                  >
+                                    <CreditCard className="w-3 h-3" />
+                                    <span>Receive Pay</span>
+                                  </button>
+                                )}
+                                {due.paid_amount > 0 && (
+                                  <button
+                                    type="button"
+                                    id={`profile-edit-pay-btn-${due.id}`}
+                                    onClick={() => {
+                                      setEditingPaymentDue(due);
+                                      setEditingPaymentRecord(null);
+                                    }}
+                                    className="px-2 py-1 text-[11px] font-bold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 rounded-lg transition-colors cursor-pointer flex items-center gap-1 whitespace-nowrap shadow-2xs"
+                                    title="Edit received payment details"
+                                  >
+                                    <Edit2 className="w-3 h-3" />
+                                    <span>Edit Pay</span>
+                                  </button>
+                                )}
+                              </div>
                             </td>
                           </tr>
                         );
@@ -535,8 +557,39 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                               <p className="text-xs text-slate-500 italic mt-0.5">Note: {p.notes}</p>
                             )}
                           </div>
-                          <div className="text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-lg text-xs font-bold border border-emerald-200 shrink-0">
-                            Paid
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              id={`history-edit-pay-btn-${p.id}`}
+                              onClick={() => {
+                                const matchedDue = data.dues.find((d) => d.id === p.monthly_due_id) || {
+                                  id: p.monthly_due_id,
+                                  chit_id: p.chit_id,
+                                  member_id: p.member_id,
+                                  month_number: p.month_number,
+                                  month_name: p.month_name,
+                                  due_amount: p.amount,
+                                  paid_amount: p.amount,
+                                  balance_amount: 0,
+                                  status: 'PAID' as const,
+                                  due_date: p.payment_date,
+                                  generated_at: p.created_at,
+                                  customer_name: data.member.customer_name,
+                                  phone: data.member.phone,
+                                  ticket_number: data.member.ticket_number,
+                                };
+                                setEditingPaymentDue(matchedDue);
+                                setEditingPaymentRecord(p);
+                              }}
+                              className="px-2.5 py-1 text-xs font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
+                              title="Edit this payment record"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                              <span>Edit</span>
+                            </button>
+                            <div className="text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-lg text-xs font-bold border border-emerald-200 shrink-0">
+                              Paid
+                            </div>
                           </div>
                         </div>
                       ))}
@@ -559,6 +612,23 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Edit Received Payment Modal */}
+      {editingPaymentDue && (
+        <EditPaymentModal
+          due={editingPaymentDue}
+          initialPayment={editingPaymentRecord}
+          onClose={() => {
+            setEditingPaymentDue(null);
+            setEditingPaymentRecord(null);
+          }}
+          onSuccess={() => {
+            fetchProfile();
+            setEditingPaymentDue(null);
+            setEditingPaymentRecord(null);
+          }}
+        />
+      )}
     </div>
   );
 };

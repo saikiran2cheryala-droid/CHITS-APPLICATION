@@ -6,7 +6,6 @@ import {
   LogOut,
   Database,
   ShieldCheck,
-  ShieldAlert,
   Settings,
   Award,
   CreditCard,
@@ -31,9 +30,9 @@ import { DeleteChitModal } from './components/DeleteChitModal';
 export default function App() {
   // Authentication State
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [expiredUser, setExpiredUser] = useState<User | null>(null);
   const [authChecking, setAuthChecking] = useState(true);
   const [isSecuritySettingsOpen, setIsSecuritySettingsOpen] = useState(false);
-  const [showSecurityNotice, setShowSecurityNotice] = useState(true);
 
   // App Navigation & Selected View
   const [selectedChitId, setSelectedChitId] = useState<string | null>(null);
@@ -80,17 +79,38 @@ export default function App() {
           if (res.token) {
             setAuthSession(res.token, res.user);
           }
-          setCurrentUser(res.user);
+          if (res.status === 'PASSWORD_EXPIRED' || res.user.is_password_expired) {
+            setExpiredUser(res.user);
+            setCurrentUser(null);
+          } else {
+            setCurrentUser(res.user);
+            setExpiredUser(null);
+          }
         }
       })
       .catch(() => {
         // Session not found, modal will prompt
         setCurrentUser(null);
+        setExpiredUser(null);
       })
       .finally(() => {
         setAuthChecking(false);
       });
   }, []);
+
+  // Listen for backend 403 password-expired events during active sessions
+  useEffect(() => {
+    const handlePasswordExpired = () => {
+      if (currentUser) {
+        setExpiredUser(currentUser);
+        setCurrentUser(null);
+      }
+    };
+    window.addEventListener('auth:password_expired', handlePasswordExpired);
+    return () => {
+      window.removeEventListener('auth:password_expired', handlePasswordExpired);
+    };
+  }, [currentUser]);
 
   // Fetch Dashboard stats & chits
   useEffect(() => {
@@ -154,7 +174,9 @@ export default function App() {
   if (!currentUser) {
     return (
       <LoginPage
+        initialExpiredUser={expiredUser}
         onLoginSuccess={(user) => {
+          setExpiredUser(null);
           setCurrentUser(user);
           triggerRefresh();
         }}
@@ -253,38 +275,6 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {/* Security Recommendation Banner */}
-        {showSecurityNotice && (
-          <div className="mb-5 bg-amber-50 border border-amber-200 rounded-2xl p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-100 text-amber-800 flex items-center justify-center shrink-0 border border-amber-200">
-                <ShieldAlert className="w-5 h-5 text-amber-700" />
-              </div>
-              <div>
-                <h4 className="text-xs font-bold text-amber-900">Security Recommendation</h4>
-                <p className="text-xs text-amber-800">
-                  For security, change your initial password from <strong>Settings → Security</strong>.
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 self-end sm:self-auto">
-              <button
-                onClick={() => setIsSecuritySettingsOpen(true)}
-                className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer"
-              >
-                Change Password
-              </button>
-              <button
-                onClick={() => setShowSecurityNotice(false)}
-                className="p-1.5 text-amber-600 hover:text-amber-800 rounded-lg cursor-pointer"
-                title="Dismiss"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        )}
-
         {selectedChitId ? (
           <ChitDetailView
             chitId={selectedChitId}
@@ -303,6 +293,7 @@ export default function App() {
             onSelectChit={(chitId) => setSelectedChitId(chitId)}
             onOpenCustomerProfile={(memberId) => setCustomerProfileId(memberId)}
             onGlobalSearchClick={() => setIsGlobalSearchOpen(true)}
+            onOpenPaymentModal={(due) => setPaymentDue(due)}
             onEditChit={(chit) => setEditingChit(chit)}
             onDeleteChit={(chit) => setDeletingChit(chit)}
           />
@@ -331,9 +322,15 @@ export default function App() {
         isOpen={isSecuritySettingsOpen}
         user={currentUser}
         onClose={() => setIsSecuritySettingsOpen(false)}
-        onPasswordChanged={() => {
+        onPasswordChanged={(updatedUser, newToken) => {
           setIsSecuritySettingsOpen(false);
-          handleLogout();
+          if (updatedUser && newToken) {
+            setAuthSession(newToken, updatedUser);
+            setCurrentUser(updatedUser);
+            setExpiredUser(null);
+          } else {
+            handleLogout();
+          }
         }}
         onProfileUpdated={(updated) => {
           setCurrentUser(updated);

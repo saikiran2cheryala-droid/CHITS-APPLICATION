@@ -89,24 +89,9 @@ export const LiftModal: React.FC<LiftModalProps> = ({
       const existingNotes = selectedMember.lift_notes || '';
       setNotes(existingNotes);
     } else {
-      // New lift: Reset fields, default date to today, payment method to Cash
-      const isDefaultOccupied = members.some(
-        (m) => m.lift_status === 'lifted' && m.lift_month === defaultMonth && m.id !== memberId
-      );
-      const initialMonth = defaultMonth && !isDefaultOccupied && defaultMonth >= 1 && defaultMonth <= totalMonths ? defaultMonth : '';
-      setLiftMonth(initialMonth);
-
-      if (typeof initialMonth === 'number') {
-        const initialRule = rules.find((r) => r.month_number === initialMonth);
-        if (initialRule && initialRule.expected_lift_payout > 0) {
-          setAmountReceived(initialRule.expected_lift_payout);
-        } else {
-          setAmountReceived('');
-        }
-      } else {
-        setAmountReceived('');
-      }
-
+      // New lift: Lift Month initially blank - user must manually select Lift Month
+      setLiftMonth('');
+      setAmountReceived('');
       setLiftDate(new Date().toISOString().split('T')[0]);
       setPaymentMethod('Cash');
       setReferenceNumber('');

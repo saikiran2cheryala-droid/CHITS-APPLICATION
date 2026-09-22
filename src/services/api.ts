@@ -45,13 +45,19 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   });
 
   if (!response.ok) {
-    if (response.status === 401 && !endpoint.includes('/api/auth/login')) {
+    if (response.status === 401 && !endpoint.includes('/api/auth/login') && !endpoint.includes('/api/auth/forgot-password')) {
       clearAuthSession();
     }
     let errMessage = `Error ${response.status}: ${response.statusText}`;
     try {
       const errorData = await response.json();
-      if (errorData.error) errMessage = errorData.error;
+      if (response.status === 403 && errorData.error === 'PASSWORD_EXPIRED') {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('auth:password_expired', { detail: errorData }));
+        }
+      }
+      if (errorData.message) errMessage = errorData.message;
+      else if (errorData.error) errMessage = errorData.error;
     } catch {
       // Ignore JSON parse failure
     }
@@ -64,16 +70,22 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 export const api = {
   auth: {
     login: async (loginId: string, password: string) => {
-      const res = await request<{ user: User; token: string }>('/api/auth/login', {
+      const res = await request<{
+        status?: string;
+        user: User;
+        token?: string;
+        tempToken?: string;
+        message?: string;
+      }>('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ loginId, password }),
       });
-      if (res.token && res.user) {
+      if (res.token && res.user && res.status !== 'PASSWORD_EXPIRED') {
         setAuthSession(res.token, res.user);
       }
       return res;
     },
-    me: () => request<{ user: User; token?: string }>('/api/auth/me'),
+    me: () => request<{ status?: string; user: User; token?: string; message?: string }>('/api/auth/me'),
     logout: async () => {
       try {
         await request<{ success: boolean }>('/api/auth/logout', { method: 'POST' });
@@ -81,13 +93,39 @@ export const api = {
         clearAuthSession();
       }
     },
+    getSecurityQuestion: async (loginId: string) => {
+      return request<{
+        success: boolean;
+        loginId: string;
+        security_question: string;
+      }>('/api/auth/forgot-password/question', {
+        method: 'POST',
+        body: JSON.stringify({ loginId }),
+      });
+    },
+    verifySecurityAnswer: async (loginId: string, answer: string) => {
+      return request<{
+        success: boolean;
+        resetToken: string;
+        message: string;
+      }>('/api/auth/forgot-password/verify-answer', {
+        method: 'POST',
+        body: JSON.stringify({ loginId, answer }),
+      });
+    },
     forgotPassword: async (loginId: string) => {
       return request<{
         success: boolean;
         message: string;
         maskedPhone?: string;
         maskedEmail?: string;
+        emailSent?: boolean;
+        emailMode?: string;
+        emailMessage?: string;
+        previewUrl?: string;
         devCode?: string;
+        resetToken?: string;
+        loginId?: string;
       }>('/api/auth/forgot-password', {
         method: 'POST',
         body: JSON.stringify({ loginId }),
@@ -111,11 +149,37 @@ export const api = {
         body: JSON.stringify(payload),
       });
     },
-    changePassword: async (payload: { currentPassword: string; newPassword: string; confirmPassword: string }) => {
+    changePassword: async (payload: {
+      currentPassword?: string;
+      newPassword: string;
+      confirmPassword: string;
+      tempToken?: string;
+      loginId?: string;
+    }) => {
+      const res = await request<{
+        success: boolean;
+        message: string;
+        user?: User;
+        token?: string;
+      }>('/api/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res.token && res.user) {
+        setAuthSession(res.token, res.user);
+      }
+      return res;
+    },
+    updateSecurityQuestion: async (payload: {
+      currentPassword: string;
+      securityQuestion: string;
+      securityAnswer: string;
+    }) => {
       return request<{
         success: boolean;
         message: string;
-      }>('/api/auth/change-password', {
+        security_question: string;
+      }>('/api/auth/security-question', {
         method: 'POST',
         body: JSON.stringify(payload),
       });
@@ -295,12 +359,50 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(payload),
       }),
+    update: (
+      id: string,
+      payload: {
+        amount?: number;
+        payment_method?: string;
+        reference_no?: string;
+        notes?: string;
+        payment_date?: string;
+        allow_overpayment?: boolean;
+      }
+    ) =>
+      request<{ success: boolean; payment: Payment; updatedDue: MonthlyDue }>(`/api/payments/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      }),
+    delete: (id: string) =>
+      request<{ success: boolean; message: string; updatedDue: MonthlyDue }>(`/api/payments/${id}`, {
+        method: 'DELETE',
+      }),
+    getByDueId: (dueId: string) => request<Payment[]>(`/api/dues/${dueId}/payments`),
     list: (params: { chit_id?: string; member_id?: string; limit?: number } = {}) => {
       const sp = new URLSearchParams();
       if (params.chit_id) sp.set('chit_id', params.chit_id);
       if (params.member_id) sp.set('member_id', params.member_id);
       if (params.limit) sp.set('limit', String(params.limit));
       return request<Payment[]>(`/api/payments?${sp.toString()}`);
+    },
+  },
+
+  dues: {
+    getPending: (params: { chit_id?: string; current_only?: boolean } = {}) => {
+      const sp = new URLSearchParams();
+      if (params.chit_id) sp.set('chit_id', params.chit_id);
+      if (params.current_only !== undefined) sp.set('current_only', String(params.current_only));
+      return request<{
+        dues: (MonthlyDue & {
+          chit_name: string;
+          chit_current_month: number;
+        })[];
+        summary: {
+          totalPendingMembers: number;
+          totalPendingAmount: number;
+        };
+      }>(`/api/dues/pending?${sp.toString()}`);
     },
   },
 

@@ -94,11 +94,16 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ due, onClose, onSucc
       <div id="payment-modal-container" className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden border border-slate-200 animate-in fade-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="bg-slate-900 text-white px-6 py-5 flex items-center justify-between">
-          <div>
-            <h3 className="text-lg font-bold">Record Payment</h3>
-            <p className="text-xs text-slate-300 mt-0.5">
-              Month {due.month_number} ({due.month_name})
-            </p>
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-emerald-600/30 border border-emerald-400/40 flex items-center justify-center text-emerald-400">
+              <CreditCard className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold">Receive Payment</h3>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Month {due.month_number} ({due.month_name}) • {due.customer_name}
+              </p>
+            </div>
           </div>
           <button
             id="close-payment-modal-btn"
@@ -278,14 +283,14 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ due, onClose, onSucc
               id="save-payment-btn"
               type="submit"
               disabled={isSubmitting || amount <= 0}
-              className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white text-sm font-bold rounded-xl shadow-sm hover:shadow transition-all disabled:opacity-50 flex items-center gap-2"
+              className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white text-sm font-bold rounded-xl shadow-sm hover:shadow transition-all disabled:opacity-50 flex items-center gap-2 cursor-pointer"
             >
               {isSubmitting ? (
-                <span>Saving...</span>
+                <span>Receiving...</span>
               ) : (
                 <>
                   <CheckCircle className="w-4 h-4" />
-                  <span>SAVE PAYMENT ({formatINR(amount)})</span>
+                  <span>RECEIVE PAYMENT ({formatINR(amount)})</span>
                 </>
               )}
             </button>

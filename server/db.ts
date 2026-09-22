@@ -17,13 +17,91 @@ db.pragma('foreign_keys = ON');
 
 export function hashPassword(plainText: string, salt?: string) {
   const actualSalt = salt || crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(plainText, actualSalt, 10000, 64, 'sha512').toString('hex');
+  const hash = crypto.pbkdf2Sync(plainText, actualSalt, 100000, 64, 'sha512').toString('hex');
   return { hash, salt: actualSalt };
 }
 
-export function verifyPassword(plainText: string, storedHash: string, salt: string) {
-  const hash = crypto.pbkdf2Sync(plainText, salt, 10000, 64, 'sha512').toString('hex');
-  return hash === storedHash;
+export function verifyPassword(plainText: string, storedHash: string, salt: string): boolean {
+  try {
+    // 1. Try modern 100,000 iterations
+    const hash = crypto.pbkdf2Sync(plainText, salt, 100000, 64, 'sha512').toString('hex');
+    const hashBuf = Buffer.from(hash, 'hex');
+    const storedBuf = Buffer.from(storedHash, 'hex');
+    if (hashBuf.length === storedBuf.length && crypto.timingSafeEqual(hashBuf, storedBuf)) {
+      return true;
+    }
+    // 2. Fallback check for legacy 10,000 iterations
+    const legacyHash = crypto.pbkdf2Sync(plainText, salt, 10000, 64, 'sha512').toString('hex');
+    const legacyBuf = Buffer.from(legacyHash, 'hex');
+    if (legacyBuf.length === storedBuf.length && crypto.timingSafeEqual(legacyBuf, storedBuf)) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+export function hashSecurityAnswer(answer: string): string {
+  const normalized = answer.trim().toLowerCase().replace(/\s+/g, ' ');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(normalized, salt, 10000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+export function verifySecurityAnswer(answer: string, storedCombinedHash: string): boolean {
+  try {
+    if (!storedCombinedHash || !storedCombinedHash.includes(':')) return false;
+    const [salt, storedHash] = storedCombinedHash.split(':');
+    const normalized = answer.trim().toLowerCase().replace(/\s+/g, ' ');
+    const hash = crypto.pbkdf2Sync(normalized, salt, 10000, 64, 'sha512').toString('hex');
+    const hashBuf = Buffer.from(hash, 'hex');
+    const storedBuf = Buffer.from(storedHash, 'hex');
+    if (hashBuf.length !== storedBuf.length) return false;
+    return crypto.timingSafeEqual(hashBuf, storedBuf);
+  } catch (_) {
+    return false;
+  }
+}
+
+export function validatePasswordStrength(password: string): { isValid: boolean; error?: string } {
+  if (!password || password.length < 8) {
+    return { isValid: false, error: 'Password must be at least 8 characters long.' };
+  }
+  if (!/[A-Z]/.test(password)) {
+    return { isValid: false, error: 'Password must contain at least one uppercase letter (A-Z).' };
+  }
+  if (!/[a-z]/.test(password)) {
+    return { isValid: false, error: 'Password must contain at least one lowercase letter (a-z).' };
+  }
+  if (!/[0-9]/.test(password)) {
+    return { isValid: false, error: 'Password must contain at least one number (0-9).' };
+  }
+  if (!/[!@#$%^&*(),.?":{}|<>\-_=+]/.test(password)) {
+    return { isValid: false, error: 'Password must contain at least one special character (!@#$%^&*...).' };
+  }
+  return { isValid: true };
+}
+
+export function getPasswordExpirationDate(changedAtStr: string): Date {
+  const date = new Date(changedAtStr);
+  const year = date.getFullYear();
+  const month = date.getMonth();
+  const day = date.getDate();
+  const targetMonth = month + 3;
+  const expires = new Date(date.getTime());
+  expires.setFullYear(year, targetMonth, day);
+  // If the target month has fewer days than 'day' (e.g. Nov 31 -> Dec 1), clamp to last day of target month
+  if (expires.getMonth() !== ((targetMonth % 12) + 12) % 12) {
+    expires.setDate(0);
+  }
+  return expires;
+}
+
+export function isPasswordExpired(changedAtStr?: string | null): boolean {
+  if (!changedAtStr) return false;
+  const expiresAt = getPasswordExpirationDate(changedAtStr);
+  return Date.now() > expiresAt.getTime();
 }
 
 export function hashToken(token: string) {
@@ -32,6 +110,10 @@ export function hashToken(token: string) {
 
 export function sanitizeUser(user: any) {
   if (!user) return null;
+  const changedAt = user.password_changed_at || user.created_at;
+  const expiresAt = changedAt ? getPasswordExpirationDate(changedAt).toISOString() : null;
+  const expired = isPasswordExpired(changedAt);
+
   return {
     id: user.id,
     login_id: user.login_id || user.username,
@@ -41,6 +123,10 @@ export function sanitizeUser(user: any) {
     recovery_email: user.recovery_email || '',
     recovery_phone: user.recovery_phone || '',
     is_active: user.is_active !== 0,
+    password_changed_at: user.password_changed_at || null,
+    password_expires_at: expiresAt,
+    is_password_expired: expired,
+    security_question: user.security_question || 'What is your primary contact number?',
     created_at: user.created_at,
     updated_at: user.updated_at || user.created_at,
     last_login_at: user.last_login_at || null,
@@ -62,6 +148,11 @@ export function initDatabase() {
       is_active INTEGER DEFAULT 1,
       failed_login_attempts INTEGER DEFAULT 0,
       locked_until TEXT,
+      password_changed_at TEXT,
+      security_question TEXT,
+      security_answer_hash TEXT,
+      failed_recovery_attempts INTEGER DEFAULT 0,
+      recovery_locked_until TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT,
       last_login_at TEXT
@@ -254,23 +345,44 @@ export function initDatabase() {
       db.exec("DROP INDEX IF EXISTS idx_members_phone_unique");
       db.exec("DROP INDEX IF EXISTS members_phone_unique");
     } catch (_) {}
+    // Safe migration for users table
+    const userInfo = db.prepare("PRAGMA table_info(users)").all() as any[];
+    const userCols = userInfo.map(col => col.name);
+    if (!userCols.includes('password_changed_at')) {
+      db.exec("ALTER TABLE users ADD COLUMN password_changed_at TEXT");
+    }
+    if (!userCols.includes('security_question')) {
+      db.exec("ALTER TABLE users ADD COLUMN security_question TEXT");
+    }
+    if (!userCols.includes('security_answer_hash')) {
+      db.exec("ALTER TABLE users ADD COLUMN security_answer_hash TEXT");
+    }
+    if (!userCols.includes('failed_recovery_attempts')) {
+      db.exec("ALTER TABLE users ADD COLUMN failed_recovery_attempts INTEGER DEFAULT 0");
+    }
+    if (!userCols.includes('recovery_locked_until')) {
+      db.exec("ALTER TABLE users ADD COLUMN recovery_locked_until TEXT");
+    }
   } catch (err) {
     console.error('Migration note:', err);
   }
 
-  // Ensure Initial Admin Account: Login ID 9640488507 with hashed password 9640488507
+  // Ensure Initial Admin Account: Login ID 9640488507 with hashed password Saikiran@507
   const targetLoginId = '9640488507';
+  const targetInitialPassword = 'Saikiran@507';
   const existingAdmin = db.prepare("SELECT * FROM users WHERE login_id = ? OR username = ?").get(targetLoginId, targetLoginId) as any;
   const now = new Date().toISOString();
 
   if (!existingAdmin) {
-    const { hash, salt } = hashPassword('9640488507');
+    const { hash, salt } = hashPassword(targetInitialPassword);
+    const defaultAnswerHash = hashSecurityAnswer('9640488507');
     db.prepare(`
       INSERT INTO users (
         id, login_id, username, password_hash, salt, name, role,
         recovery_email, recovery_phone, is_active, failed_login_attempts,
+        password_changed_at, security_question, security_answer_hash,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
     `).run(
       'admin-9640488507',
       targetLoginId,
@@ -282,30 +394,164 @@ export function initDatabase() {
       'saikiran2cheryala@gmail.com',
       '9640488507',
       now,
+      'What is your primary contact number?',
+      defaultAnswerHash,
+      now,
       now
     );
-    console.log(`Initial Admin created with Login ID: ${targetLoginId} (Password hashed securely).`);
+    console.log(`[AUTH] Production Admin account initialized for Login ID: ${targetLoginId}`);
   } else {
-    // If existingAdmin cannot be authenticated with 9640488507, ensure 9640488507 is valid
-    const isCurrentValid = verifyPassword('9640488507', existingAdmin.password_hash, existingAdmin.salt);
+    // If existingAdmin password is not yet verified with Saikiran@507, update to the required production password
+    const isCurrentValid = verifyPassword(targetInitialPassword, existingAdmin.password_hash, existingAdmin.salt);
     if (!isCurrentValid) {
-      const { hash, salt } = hashPassword('9640488507');
+      const { hash, salt } = hashPassword(targetInitialPassword);
       db.prepare(`
-        UPDATE users SET password_hash = ?, salt = ?, is_active = 1, failed_login_attempts = 0, locked_until = NULL, updated_at = ?
+        UPDATE users SET 
+          password_hash = ?, 
+          salt = ?, 
+          password_changed_at = COALESCE(password_changed_at, ?),
+          is_active = 1, 
+          failed_login_attempts = 0, 
+          locked_until = NULL, 
+          updated_at = ?
         WHERE id = ?
-      `).run(hash, salt, now, existingAdmin.id);
-      console.log(`Initial Admin password hash synced for Login ID: ${targetLoginId}`);
+      `).run(hash, salt, now, now, existingAdmin.id);
+      console.log(`[AUTH] Production Admin password hash synced for Login ID: ${targetLoginId}`);
     } else {
       // Ensure user is unlocked and active
-      db.prepare("UPDATE users SET is_active = 1, failed_login_attempts = 0, locked_until = NULL WHERE id = ?").run(existingAdmin.id);
+      db.prepare(`
+        UPDATE users SET 
+          is_active = 1, 
+          failed_login_attempts = 0, 
+          locked_until = NULL,
+          password_changed_at = COALESCE(password_changed_at, ?)
+        WHERE id = ?
+      `).run(now, existingAdmin.id);
+    }
+
+    // Ensure security question & answer hash exist
+    if (!existingAdmin.security_question || !existingAdmin.security_answer_hash) {
+      const defaultAnswerHash = hashSecurityAnswer('9640488507');
+      db.prepare(`
+        UPDATE users SET 
+          security_question = COALESCE(security_question, 'What is your primary contact number?'),
+          security_answer_hash = COALESCE(security_answer_hash, ?)
+        WHERE id = ?
+      `).run(defaultAnswerHash, existingAdmin.id);
+    }
+
+    // Ensure recovery email and phone are set for administrator accounts
+    try {
+      if (!existingAdmin.recovery_email) {
+        db.prepare("UPDATE users SET recovery_email = ?, recovery_phone = ? WHERE id = ?")
+          .run('saikiran2cheryala@gmail.com', '9640488507', existingAdmin.id);
+      }
+    } catch (_) {}
+  }
+
+  // Clean up any legacy or duplicate admin accounts to maintain strict production credential single-identity
+  try {
+    db.prepare("DELETE FROM users WHERE id = 'admin-1' OR (login_id != ? AND username != ? AND role = 'admin')").run(targetLoginId, targetLoginId);
+    db.prepare("DELETE FROM sessions WHERE user_id = 'admin-1'").run();
+  } catch (_) {}
+}
+
+const MONTH_NAMES = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'
+];
+
+export function getCurrentKolkataYearMonth(): { year: number; month: number } {
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'numeric',
+  });
+  const parts = formatter.formatToParts(now);
+  let year = now.getFullYear();
+  let month = now.getMonth() + 1; // 1-12
+  for (const part of parts) {
+    if (part.type === 'year') year = parseInt(part.value, 10);
+    if (part.type === 'month') month = parseInt(part.value, 10);
+  }
+  return { year, month };
+}
+
+export function parseYearMonth(str: string): { year: number; month: number } | null {
+  if (!str) return null;
+  const s = str.trim().toLowerCase();
+
+  // Format: 'YYYY-MM' or 'YYYY/MM'
+  const isoMatch = s.match(/^(\d{4})[-\/](\d{1,2})$/);
+  if (isoMatch) {
+    return { year: parseInt(isoMatch[1], 10), month: parseInt(isoMatch[2], 10) };
+  }
+
+  // Format: 'MM/YYYY' or 'M/YYYY'
+  const slashMatch = s.match(/^(\d{1,2})[-\/](\d{4})$/);
+  if (slashMatch) {
+    return { year: parseInt(slashMatch[2], 10), month: parseInt(slashMatch[1], 10) };
+  }
+
+  // Format: 'MonthName YYYY' or 'Mon YYYY' (e.g. 'February 2026', 'August 2026')
+  const nameMatch = s.match(/([a-z]+)[\s,]+(\d{4})/i);
+  if (nameMatch) {
+    const monthName = nameMatch[1].toLowerCase();
+    const year = parseInt(nameMatch[2], 10);
+    const mIdx = MONTH_NAMES.findIndex(m => m.startsWith(monthName.substring(0, 3)));
+    if (mIdx !== -1) {
+      return { year, month: mIdx + 1 };
     }
   }
+
+  // Format: 'YYYY MonthName'
+  const reverseMatch = s.match(/(\d{4})[\s,]+([a-z]+)/i);
+  if (reverseMatch) {
+    const year = parseInt(reverseMatch[1], 10);
+    const monthName = reverseMatch[2].toLowerCase();
+    const mIdx = MONTH_NAMES.findIndex(m => m.startsWith(monthName.substring(0, 3)));
+    if (mIdx !== -1) {
+      return { year, month: mIdx + 1 };
+    }
+  }
+
+  return null;
+}
+
+export function computeChitCurrentMonth(startMonthStr: string, totalMonths: number): number {
+  if (!totalMonths || totalMonths < 1) return 1;
+  const start = parseYearMonth(startMonthStr);
+  if (!start) return 1;
+
+  const current = getCurrentKolkataYearMonth();
+
+  // Difference in months = (current.year - start.year) * 12 + (current.month - start.month)
+  const diffMonths = (current.year - start.year) * 12 + (current.month - start.month);
+
+  // If before chit start -> Month 1
+  if (diffMonths < 0) {
+    return 1;
+  }
+
+  const calculatedMonth = diffMonths + 1; // Month 1 is start month
+
+  // If after final month -> final month (totalMonths)
+  if (calculatedMonth > totalMonths) {
+    return totalMonths;
+  }
+
+  return calculatedMonth;
 }
 
 // User Helpers
 export function findUserByLoginId(loginId: string) {
   const trimmed = loginId.trim();
-  return db.prepare("SELECT * FROM users WHERE (login_id = ? OR username = ?) AND is_active = 1").get(trimmed, trimmed) as any;
+  return db.prepare(`
+    SELECT * FROM users 
+    WHERE (login_id = ? OR username = ? OR LOWER(recovery_email) = LOWER(?)) 
+      AND is_active = 1
+  `).get(trimmed, trimmed, trimmed) as any;
 }
 
 export function recordFailedLogin(userId: string) {
@@ -398,6 +644,23 @@ export function createSession(
   };
 }
 
+export function recordFailedRecovery(userId: string) {
+  const user = db.prepare("SELECT failed_recovery_attempts FROM users WHERE id = ?").get(userId) as any;
+  const attempts = (user?.failed_recovery_attempts || 0) + 1;
+  const now = Date.now();
+  let recoveryLockedUntil: string | null = null;
+  if (attempts >= 5) {
+    // Lock recovery attempts for 15 minutes
+    recoveryLockedUntil = new Date(now + 15 * 60 * 1000).toISOString();
+  }
+  db.prepare("UPDATE users SET failed_recovery_attempts = ?, recovery_locked_until = ? WHERE id = ?").run(attempts, recoveryLockedUntil, userId);
+  return { attempts, isLocked: attempts >= 5, recoveryLockedUntil };
+}
+
+export function resetFailedRecovery(userId: string) {
+  db.prepare("UPDATE users SET failed_recovery_attempts = 0, recovery_locked_until = NULL WHERE id = ?").run(userId);
+}
+
 export function verifySessionToken(rawToken: string) {
   if (!rawToken) return null;
   const tokenHash = hashToken(rawToken);
@@ -414,6 +677,8 @@ export function verifySessionToken(rawToken: string) {
       u.recovery_email,
       u.recovery_phone,
       u.is_active,
+      u.password_changed_at,
+      u.security_question,
       u.created_at,
       u.updated_at,
       u.last_login_at
@@ -461,6 +726,46 @@ export function createPasswordReset(userId: string) {
   return { recoveryCode, resetToken, expiresAt };
 }
 
+export function createSecurityResetToken(userId: string) {
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  const id = 'sec-reset-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex');
+  const now = new Date().toISOString();
+  // Expires in 15 minutes
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  db.prepare(`
+    INSERT INTO password_resets (id, user_id, recovery_code, reset_token, expires_at, used, created_at)
+    VALUES (?, ?, 'SECURITY_ANSWER', ?, ?, 0, ?)
+  `).run(id, userId, resetToken, expiresAt, now);
+
+  return { resetToken, expiresAt };
+}
+
+export function createTempChangePasswordToken(userId: string) {
+  const tempToken = 'temp_' + crypto.randomBytes(32).toString('hex');
+  const id = 'reset-temp-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex');
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  db.prepare(`
+    INSERT INTO password_resets (id, user_id, recovery_code, reset_token, expires_at, used, created_at)
+    VALUES (?, ?, 'TEMP_EXPIRED_PASS', ?, ?, 0, ?)
+  `).run(id, userId, tempToken, expiresAt, now);
+
+  return tempToken;
+}
+
+export function verifyTempChangePasswordToken(tempToken: string) {
+  const now = new Date().toISOString();
+  const row = db.prepare(`
+    SELECT r.*, u.id as user_id, u.login_id, u.username, u.name, u.password_hash, u.salt
+    FROM password_resets r
+    JOIN users u ON r.user_id = u.id
+    WHERE r.reset_token = ? AND r.expires_at > ? AND r.used = 0 AND u.is_active = 1
+  `).get(tempToken, now) as any;
+  return row || null;
+}
+
 export function verifyPasswordResetCode(loginId: string, code: string) {
   const user = findUserByLoginId(loginId);
   if (!user) return null;
@@ -486,12 +791,17 @@ export function resetUserPasswordWithToken(resetToken: string, newPlainPassword:
     throw new Error('Reset link or token has expired or is invalid.');
   }
 
+  const validation = validatePasswordStrength(newPlainPassword);
+  if (!validation.isValid) {
+    throw new Error(validation.error || 'Password does not meet security requirements.');
+  }
+
   const { hash, salt } = hashPassword(newPlainPassword);
   db.prepare(`
     UPDATE users
-    SET password_hash = ?, salt = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ?
+    SET password_hash = ?, salt = ?, password_changed_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ?
     WHERE id = ?
-  `).run(hash, salt, now, resetRow.user_id);
+  `).run(hash, salt, now, now, resetRow.user_id);
 
   // Invalidate reset token
   db.prepare("UPDATE password_resets SET used = 1 WHERE id = ?").run(resetRow.id);
@@ -502,28 +812,82 @@ export function resetUserPasswordWithToken(resetToken: string, newPlainPassword:
   return true;
 }
 
-export function changeUserPassword(userId: string, currentPlainPassword: string, newPlainPassword: string) {
+export function changeUserPassword(
+  userId: string,
+  currentPlainPassword: string | null,
+  newPlainPassword: string,
+  skipCurrentCheck = false
+) {
   const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
   if (!user) {
     throw new Error('User not found.');
   }
 
-  if (!verifyPassword(currentPlainPassword, user.password_hash, user.salt)) {
-    throw new Error('Current password does not match.');
+  if (!skipCurrentCheck) {
+    if (!currentPlainPassword) {
+      throw new Error('Current password is required.');
+    }
+    if (!verifyPassword(currentPlainPassword, user.password_hash, user.salt)) {
+      throw new Error('Current password does not match.');
+    }
+  }
+
+  if (currentPlainPassword && currentPlainPassword === newPlainPassword) {
+    throw new Error('New password cannot be the same as your current password.');
+  }
+
+  const validation = validatePasswordStrength(newPlainPassword);
+  if (!validation.isValid) {
+    throw new Error(validation.error || 'Password does not meet security requirements.');
   }
 
   const { hash, salt } = hashPassword(newPlainPassword);
   const now = new Date().toISOString();
   db.prepare(`
     UPDATE users
-    SET password_hash = ?, salt = ?, updated_at = ?
+    SET password_hash = ?, salt = ?, password_changed_at = ?, failed_login_attempts = 0, locked_until = NULL, updated_at = ?
     WHERE id = ?
-  `).run(hash, salt, now, userId);
+  `).run(hash, salt, now, now, userId);
 
-  // Invalidate all active sessions for this user to enforce fresh login
+  // Invalidate all active sessions for this user to enforce fresh session
   destroyAllUserSessions(userId);
 
-  return true;
+  const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+  return { success: true, password_changed_at: now, user: sanitizeUser(updatedUser) };
+}
+
+export function updateUserSecurityQuestion(
+  userId: string,
+  currentPlainPassword: string,
+  securityQuestion: string,
+  securityAnswer: string
+) {
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+  if (!user) throw new Error('User not found.');
+
+  if (!verifyPassword(currentPlainPassword, user.password_hash, user.salt)) {
+    throw new Error('Current password is incorrect.');
+  }
+
+  const trimmedQ = (securityQuestion || '').trim();
+  const trimmedA = (securityAnswer || '').trim();
+  if (!trimmedQ || trimmedQ.length < 5) {
+    throw new Error('Security question must be at least 5 characters long.');
+  }
+  if (!trimmedA || trimmedA.length < 2) {
+    throw new Error('Security answer must be at least 2 characters long.');
+  }
+
+  const answerHash = hashSecurityAnswer(trimmedA);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    UPDATE users
+    SET security_question = ?, security_answer_hash = ?, updated_at = ?
+    WHERE id = ?
+  `).run(trimmedQ, answerHash, now, userId);
+
+  return { success: true, security_question: trimmedQ };
 }
 
 export function updateUserSettings(userId: string, data: { name?: string; recovery_email?: string; recovery_phone?: string }) {
@@ -544,7 +908,9 @@ export function updateUserSettings(userId: string, data: { name?: string; recove
 }
 
 /**
- * Generate or ensure monthly dues exist for a given chit and month
+ * Generate or ensure monthly dues exist for a given chit and month.
+ * Strictly idempotent: NEVER overwrites existing payments or resets paid amounts.
+ * Uses `payments` table as the ultimate source of truth.
  */
 export function ensureMonthlyDuesForChitAndMonth(chitId: string, monthNumber: number) {
   const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(chitId) as any;
@@ -562,10 +928,18 @@ export function ensureMonthlyDuesForChitAndMonth(chitId: string, monthNumber: nu
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  const syncDueStmt = db.prepare(`
+    UPDATE monthly_dues
+    SET paid_amount = ?, balance_amount = ?, status = ?
+    WHERE id = ?
+  `);
+
   const now = new Date().toISOString();
   const tx = db.transaction(() => {
     for (const member of members) {
-      if (!duesMap.has(member.id)) {
+      const existingDue = duesMap.get(member.id);
+
+      if (!existingDue) {
         // Check if member lifted
         const lift = db.prepare('SELECT * FROM lift_details WHERE member_id = ?').get(member.id) as any;
         let dueAmount = rule.pre_lift_payment;
@@ -574,6 +948,15 @@ export function ensureMonthlyDuesForChitAndMonth(chitId: string, monthNumber: nu
         }
 
         const dueId = `due-${chitId}-${member.id}-m${monthNumber}`;
+
+        // Check if any payment was previously recorded in payments table for this member/month
+        const paymentSumRow = db.prepare(
+          'SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE (monthly_due_id = ? OR (chit_id = ? AND member_id = ? AND month_number = ?))'
+        ).get(dueId, chitId, member.id, monthNumber) as any;
+        const recordedPaid = paymentSumRow ? Number(paymentSumRow.total) : 0;
+        const finalBalance = Math.max(0, dueAmount - recordedPaid);
+        const finalStatus = recordedPaid >= dueAmount ? 'PAID' : (recordedPaid > 0 ? 'PARTIAL' : 'PENDING');
+
         insertStmt.run(
           dueId,
           chitId,
@@ -581,12 +964,24 @@ export function ensureMonthlyDuesForChitAndMonth(chitId: string, monthNumber: nu
           monthNumber,
           rule.month_name,
           dueAmount,
-          0,
-          dueAmount,
-          'PENDING',
+          recordedPaid,
+          finalBalance,
+          finalStatus,
           now,
           now
         );
+      } else {
+        // Self-heal: ensure paid_amount on due matches actual sum of recorded payments
+        const paymentSumRow = db.prepare(
+          'SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?'
+        ).get(existingDue.id) as any;
+        const totalPaidInPayments = paymentSumRow ? Number(paymentSumRow.total) : 0;
+
+        if (totalPaidInPayments > 0 && Number(existingDue.paid_amount) !== totalPaidInPayments) {
+          const correctedBalance = Math.max(0, Number(existingDue.due_amount) - totalPaidInPayments);
+          const correctedStatus = totalPaidInPayments >= Number(existingDue.due_amount) ? 'PAID' : (totalPaidInPayments > 0 ? 'PARTIAL' : 'PENDING');
+          syncDueStmt.run(totalPaidInPayments, correctedBalance, correctedStatus, existingDue.id);
+        }
       }
     }
   });

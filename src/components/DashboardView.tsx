@@ -17,8 +17,11 @@ import {
   Edit2,
   Trash2,
 } from 'lucide-react';
-import { DashboardStats, Chit } from '../types';
+import { DashboardStats, Chit, MonthlyDue } from '../types';
 import { formatINR } from '../utils/formatters';
+import { QuickActionsFloatingMenu } from './QuickActionsFloatingMenu';
+import { DueMembersModal } from './DueMembersModal';
+import { QuickPaymentSelectModal } from './QuickPaymentSelectModal';
 
 interface DashboardViewProps {
   stats: DashboardStats | null;
@@ -27,6 +30,7 @@ interface DashboardViewProps {
   onSelectChit: (chitId: string) => void;
   onOpenCustomerProfile: (memberId: string) => void;
   onGlobalSearchClick: () => void;
+  onOpenPaymentModal?: (due: MonthlyDue) => void;
   onEditChit?: (chit: Chit) => void;
   onDeleteChit?: (chit: Chit) => void;
 }
@@ -38,11 +42,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSelectChit,
   onOpenCustomerProfile,
   onGlobalSearchClick,
+  onOpenPaymentModal,
   onEditChit,
   onDeleteChit,
 }) => {
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'active' | 'completed'>('ALL');
   const [chitSearch, setChitSearch] = useState('');
+  const [isDueMembersOpen, setIsDueMembersOpen] = useState(false);
+  const [isQuickPaySelectOpen, setIsQuickPaySelectOpen] = useState(false);
 
   const filteredChits = chits.filter((chit) => {
     const matchesStatus = filterStatus === 'ALL' || chit.status === filterStatus;
@@ -145,11 +152,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
 
         {/* Total Pending Dues */}
-        <div className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 shadow-xs flex items-center justify-between">
+        <div
+          onClick={() => setIsDueMembersOpen(true)}
+          title="Click to view all due members"
+          className="bg-white p-4 sm:p-5 rounded-2xl border border-slate-200 hover:border-red-300 hover:shadow-xs shadow-xs flex items-center justify-between cursor-pointer transition-all group"
+        >
           <div>
-            <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
-              Pending Outstanding
-            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
+                Pending Outstanding
+              </span>
+              <span className="text-[10px] text-red-600 font-bold opacity-0 group-hover:opacity-100 transition-opacity">
+                View List →
+              </span>
+            </div>
             <span className="text-xl sm:text-2xl font-black text-red-600 font-mono mt-1 block truncate">
               {formatINR(stats?.totalOutstanding ?? stats?.totalPendingAmount ?? 0)}
             </span>
@@ -157,7 +173,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Current Month Dues
             </span>
           </div>
-          <div className="w-12 h-12 rounded-2xl bg-red-50 text-red-600 flex items-center justify-center">
+          <div className="w-12 h-12 rounded-2xl bg-red-50 text-red-600 flex items-center justify-center group-hover:scale-105 transition-transform">
             <AlertCircle className="w-6 h-6" />
           </div>
         </div>
@@ -393,6 +409,41 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Floating Quick Actions Menu */}
+      <QuickActionsFloatingMenu
+        onOpenRecordPayment={() => setIsQuickPaySelectOpen(true)}
+        onOpenDueMembers={() => setIsDueMembersOpen(true)}
+        onOpenNewChit={onOpenNewChitWizard}
+        onOpenSearch={onGlobalSearchClick}
+        pendingDueCount={stats?.totalPendingCustomers}
+      />
+
+      {/* Due Members Overview Modal */}
+      <DueMembersModal
+        isOpen={isDueMembersOpen}
+        onClose={() => setIsDueMembersOpen(false)}
+        chits={chits}
+        onRecordPayment={(due) => {
+          if (onOpenPaymentModal) {
+            onOpenPaymentModal(due);
+          }
+        }}
+        onOpenCustomerProfile={onOpenCustomerProfile}
+        onSelectChit={onSelectChit}
+      />
+
+      {/* Quick Record Payment Selector Modal */}
+      <QuickPaymentSelectModal
+        isOpen={isQuickPaySelectOpen}
+        onClose={() => setIsQuickPaySelectOpen(false)}
+        chits={chits}
+        onSelectDue={(due) => {
+          if (onOpenPaymentModal) {
+            onOpenPaymentModal(due);
+          }
+        }}
+      />
     </div>
   );
 };

@@ -22,13 +22,25 @@ import {
   sanitizeUser,
   ensureMonthlyDuesForChitAndMonth,
   syncDuesOnLift,
+  isPasswordExpired,
+  createTempChangePasswordToken,
+  verifyTempChangePasswordToken,
+  createSecurityResetToken,
+  verifySecurityAnswer,
+  recordFailedRecovery,
+  resetFailedRecovery,
+  updateUserSecurityQuestion,
+  validatePasswordStrength,
+  computeChitCurrentMonth,
 } from './server/db.ts';
+import { sendPasswordRecoveryEmail } from './server/email.ts';
 
 // Initialize SQLite DB & ensure initial admin exists
 initDatabase();
 
 const app = express();
-const PORT = 3000;
+app.set('trust proxy', 1);
+const PORT = Number(process.env.PORT || 3000);
 
 app.use(express.json());
 app.use(cookieParser());
@@ -57,6 +69,16 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
     return res.status(401).json({ error: 'Unauthorized. Please login.' });
   }
 
+  // Password expired check: block access to business data until password renewed
+  if (
+    user.is_password_expired &&
+    !req.originalUrl.includes('/api/auth/change-password') &&
+    !req.originalUrl.includes('/api/auth/logout') &&
+    !req.originalUrl.includes('/api/auth/me')
+  ) {
+    return res.status(403).json({ error: 'PASSWORD_EXPIRED', message: 'Your password has expired. Please renew your password.' });
+  }
+
   (req as any).user = user;
   (req as any).token = token;
   next();
@@ -66,199 +88,450 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
 
 // POST /api/auth/login
 app.post('/api/auth/login', (req, res) => {
-  const loginId = (req.body.loginId || req.body.username || '').toString().trim();
-  const password = (req.body.password || '').toString();
+  try {
+    const loginId = (req.body.loginId || req.body.username || '').toString().trim();
+    const password = (req.body.password || '').toString();
 
-  if (!loginId || !password) {
-    return res.status(400).json({ error: 'Login ID and password are required.' });
-  }
-
-  const user = findUserByLoginId(loginId);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid Login ID or password.' });
-  }
-
-  // Check rate limiting / lock status
-  if (user.locked_until) {
-    const lockedUntilTime = new Date(user.locked_until).getTime();
-    if (lockedUntilTime > Date.now()) {
-      return res.status(429).json({ error: 'Too many login attempts. Please try again later.' });
+    if (!loginId || !password) {
+      return res.status(400).json({ error: 'Login ID and password are required.' });
     }
-  }
 
-  // Verify password using secure hash
-  const isValid = verifyPassword(password, user.password_hash, user.salt);
-  if (!isValid) {
-    const failInfo = recordFailedLogin(user.id);
-    if (failInfo.isLocked) {
-      return res.status(429).json({ error: 'Too many login attempts. Please try again later.' });
+    const user = findUserByLoginId(loginId);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid Login ID or password.' });
     }
-    return res.status(401).json({ error: 'Invalid Login ID or password.' });
+
+    // Check rate limiting / lock status
+    if (user.locked_until) {
+      const lockedUntilTime = new Date(user.locked_until).getTime();
+      if (lockedUntilTime > Date.now()) {
+        return res.status(429).json({ error: 'Too many failed login attempts. Please try again after 15 minutes.' });
+      }
+    }
+
+    // Verify password using secure constant-time PBKDF2 hash
+    const isValid = verifyPassword(password, user.password_hash, user.salt);
+    if (!isValid) {
+      const failInfo = recordFailedLogin(user.id);
+      if (failInfo.isLocked) {
+        return res.status(429).json({ error: 'Account locked due to 5 consecutive failed login attempts. Please try again in 15 minutes or use Forgot Password.' });
+      }
+      return res.status(401).json({ error: 'Invalid Login ID or password.' });
+    }
+
+    // Successful password match -> reset failed attempts
+    resetFailedLogins(user.id);
+
+    // Check 3-month calendar password expiration policy
+    const isExpired = isPasswordExpired(user.password_changed_at || user.created_at);
+    if (isExpired) {
+      // Issue a secure temporary token for password reset
+      const tempToken = createTempChangePasswordToken(user.id);
+      return res.json({
+        status: 'PASSWORD_EXPIRED',
+        error: 'PASSWORD_EXPIRED',
+        message: 'Your password has expired. Please create a new password to continue.',
+        tempToken,
+        user: sanitizeUser(user),
+      });
+    }
+
+    // Generate authenticated session
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+    const ua = req.headers['user-agent'];
+    createSession(user.id, rawToken, ip, ua);
+
+    // Set secure HTTP-only cookie
+    const isHttps = req.secure || (req.headers['x-forwarded-proto'] as string || '').toLowerCase() === 'https';
+    res.cookie('chit_session', rawToken, {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      path: '/',
+    });
+
+    return res.json({
+      status: 'SUCCESS',
+      user: sanitizeUser(user),
+      token: rawToken,
+    });
+  } catch (error: any) {
+    console.error('[AUTH LOGIN ERROR]', error);
+    return res.status(500).json({ error: 'Authentication service temporarily unavailable.' });
   }
-
-  // Successful login
-  resetFailedLogins(user.id);
-  const rawToken = crypto.randomBytes(32).toString('hex');
-  const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
-  const ua = req.headers['user-agent'];
-  createSession(user.id, rawToken, ip, ua);
-
-  // Set secure HTTP-only cookie
-  res.cookie('chit_session', rawToken, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    path: '/',
-  });
-
-  return res.json({
-    user: sanitizeUser(user),
-    token: rawToken,
-  });
 });
 
 // GET /api/auth/me
 app.get('/api/auth/me', (req, res) => {
-  const token = extractToken(req);
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized. Please login.' });
-  }
+  try {
+    const token = extractToken(req);
+    if (!token) {
+      return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Authentication required. Please login.' });
+    }
 
-  const user = verifySessionToken(token);
-  if (!user) {
-    return res.status(401).json({ error: 'Unauthorized. Please login.' });
-  }
+    const user = verifySessionToken(token);
+    if (!user) {
+      return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Session expired. Please login again.' });
+    }
 
-  return res.json({ user, token });
+    if (user.is_password_expired) {
+      return res.json({
+        status: 'PASSWORD_EXPIRED',
+        message: 'Your password has expired. Please create a new password to continue.',
+        user,
+        token,
+      });
+    }
+
+    return res.json({
+      status: 'SUCCESS',
+      user,
+      token,
+    });
+  } catch (error: any) {
+    console.error('[AUTH ME ERROR]', error);
+    return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message: 'An error occurred checking authentication.' });
+  }
 });
 
 // POST /api/auth/logout
 app.post('/api/auth/logout', (req, res) => {
-  const token = extractToken(req);
-  if (token) {
-    destroySession(token);
+  try {
+    const token = extractToken(req);
+    if (token) {
+      destroySession(token);
+    }
+    res.clearCookie('chit_session', { path: '/' });
+    return res.json({ success: true, message: 'Logged out successfully.' });
+  } catch (error: any) {
+    console.error('[AUTH LOGOUT ERROR]', error);
+    return res.json({ success: true, message: 'Logged out.' });
   }
-  res.clearCookie('chit_session', { path: '/' });
-  return res.json({ success: true, message: 'Logged out successfully.' });
 });
 
-// POST /api/auth/forgot-password
-app.post('/api/auth/forgot-password', (req, res) => {
-  const loginId = (req.body.loginId || req.body.username || '').toString().trim();
-  if (!loginId) {
-    return res.status(400).json({ error: 'Login ID is required.' });
-  }
+// POST /api/auth/forgot-password (Email-based recovery)
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const loginId = (req.body.loginId || req.body.username || '').toString().trim();
+    if (!loginId) {
+      return res.status(400).json({ error: 'Login ID is required.' });
+    }
 
-  const user = findUserByLoginId(loginId);
-  if (!user) {
-    // Show generic message without revealing if account exists
+    const user = findUserByLoginId(loginId);
+    if (!user) {
+      return res.status(404).json({ error: 'Account not found matching this Login ID.' });
+    }
+
+    if (user.recovery_locked_until) {
+      const lockedUntilTime = new Date(user.recovery_locked_until).getTime();
+      if (lockedUntilTime > Date.now()) {
+        return res.status(429).json({ error: 'Too many recovery attempts. Please try again after 15 minutes.' });
+      }
+    }
+
+    if (!user.recovery_email) {
+      return res.status(400).json({
+        error: 'No recovery email configured for this account. Please use Security Question recovery.',
+      });
+    }
+
+    const { recoveryCode, resetToken } = createPasswordReset(user.id);
+
+    const origin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+    const resetLink = `${origin}/#reset?token=${resetToken}&loginId=${encodeURIComponent(user.login_id || user.username)}`;
+
+    const emailRes = await sendPasswordRecoveryEmail({
+      to: user.recovery_email,
+      name: user.name,
+      loginId: user.login_id || user.username,
+      recoveryCode,
+      resetLink,
+      expiresInMinutes: 15,
+    });
+
+    const [local, domain] = user.recovery_email.split('@');
+    const maskedEmail = (local.length > 2 ? local[0] + '***' + local[local.length - 1] : local[0] + '***') + '@' + (domain || '');
+
     return res.json({
       success: true,
-      message: 'If the account exists, recovery instructions have been sent.',
+      message: 'Recovery code sent successfully to registered email.',
+      maskedEmail,
+      emailSent: emailRes.sent,
+      previewUrl: emailRes.previewUrl,
     });
+  } catch (error: any) {
+    console.error('[AUTH FORGOT PASSWORD EMAIL ERROR]', error);
+    return res.status(500).json({ error: 'Failed to process recovery request. Please try again later.' });
   }
-
-  const { recoveryCode, resetToken } = createPasswordReset(user.id);
-  const phone = user.recovery_phone || user.login_id || '';
-  const email = user.recovery_email || '';
-  const maskedPhone = phone ? phone.slice(0, 4) + '****' + phone.slice(-2) : 'registered mobile';
-  const maskedEmail = email ? email.replace(/^(.{2})(.*)(@.*)$/, '$1***$3') : 'registered email';
-
-  return res.json({
-    success: true,
-    message: 'If the account exists, recovery instructions have been sent.',
-    maskedPhone,
-    maskedEmail,
-    devCode: recoveryCode,
-  });
 });
 
-// POST /api/auth/verify-recovery
+// POST /api/auth/verify-recovery (Verify 6-digit recovery code)
 app.post('/api/auth/verify-recovery', (req, res) => {
-  const loginId = (req.body.loginId || '').toString().trim();
-  const recoveryCode = (req.body.recoveryCode || req.body.code || '').toString().trim();
+  try {
+    const loginId = (req.body.loginId || '').toString().trim();
+    const code = (req.body.code || req.body.recoveryCode || '').toString().trim();
 
-  if (!loginId || !recoveryCode) {
-    return res.status(400).json({ error: 'Login ID and recovery code are required.' });
+    if (!loginId || !code) {
+      return res.status(400).json({ error: 'Login ID and 6-digit recovery code are required.' });
+    }
+
+    const result = verifyPasswordResetCode(loginId, code);
+    if (!result) {
+      return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new code.' });
+    }
+
+    return res.json({
+      success: true,
+      resetToken: result.resetToken,
+      message: 'Recovery code verified successfully.',
+    });
+  } catch (error: any) {
+    console.error('[AUTH VERIFY RECOVERY ERROR]', error);
+    return res.status(500).json({ error: 'Failed to verify recovery code.' });
   }
-
-  const result = verifyPasswordResetCode(loginId, recoveryCode);
-  if (!result) {
-    return res.status(400).json({ error: 'Invalid or expired recovery code.' });
-  }
-
-  return res.json({
-    success: true,
-    resetToken: result.resetToken,
-  });
 });
 
-// POST /api/auth/reset-password
-app.post('/api/auth/reset-password', (req, res) => {
-  const { resetToken, newPassword, confirmPassword } = req.body;
-
-  if (!resetToken) {
-    return res.status(400).json({ error: 'Reset token is required.' });
-  }
-  if (!newPassword || newPassword.length < 8) {
-    return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
-  }
-  if (newPassword !== confirmPassword) {
-    return res.status(400).json({ error: 'Confirm password does not match.' });
-  }
-
+// POST /api/auth/forgot-password/question (Step 1 of security question recovery)
+app.post('/api/auth/forgot-password/question', (req, res) => {
   try {
+    const loginId = (req.body.loginId || req.body.username || '').toString().trim();
+    if (!loginId) {
+      return res.status(400).json({ error: 'MISSING_LOGIN_ID', message: 'Please enter your Login ID.' });
+    }
+
+    const user = findUserByLoginId(loginId);
+    if (!user) {
+      return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'No registered account found matching this Login ID.' });
+    }
+
+    if (user.recovery_locked_until) {
+      const lockedUntilTime = new Date(user.recovery_locked_until).getTime();
+      if (lockedUntilTime > Date.now()) {
+        return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Too many failed recovery attempts. Please try again after 15 minutes.' });
+      }
+    }
+
+    return res.json({
+      success: true,
+      loginId: user.login_id || user.username,
+      security_question: user.security_question || 'What is your primary contact number?',
+    });
+  } catch (error: any) {
+    console.error('[AUTH FORGOT QUESTION ERROR]', error);
+    return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message: 'Failed to retrieve recovery question.' });
+  }
+});
+
+// POST /api/auth/forgot-password/verify-answer (Step 2 of security question recovery)
+app.post('/api/auth/forgot-password/verify-answer', (req, res) => {
+  try {
+    const loginId = (req.body.loginId || '').toString().trim();
+    const answer = (req.body.answer || '').toString();
+
+    if (!loginId || !answer) {
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'Login ID and security answer are required.' });
+    }
+
+    const user = findUserByLoginId(loginId);
+    if (!user) {
+      return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'Account not found.' });
+    }
+
+    // Rate limiting check
+    if (user.recovery_locked_until) {
+      const lockedUntilTime = new Date(user.recovery_locked_until).getTime();
+      if (lockedUntilTime > Date.now()) {
+        return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Too many failed recovery attempts. Account recovery locked for 15 minutes.' });
+      }
+    }
+
+    // Check answer against secure hash
+    const isAnswerCorrect = user.security_answer_hash
+      ? verifySecurityAnswer(answer, user.security_answer_hash)
+      : answer.trim().toLowerCase() === (user.login_id || '').toLowerCase(); // fallback
+
+    if (!isAnswerCorrect) {
+      const failInfo = recordFailedRecovery(user.id);
+      if (failInfo.isLocked) {
+        return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: 'Maximum 5 attempts reached. Recovery is locked for 15 minutes.' });
+      }
+      return res.status(401).json({
+        error: 'INCORRECT_ANSWER',
+        message: 'Security answer is incorrect.',
+        remainingAttempts: Math.max(0, 5 - failInfo.attempts),
+      });
+    }
+
+    // Answer is correct! Reset recovery rate limiter
+    resetFailedRecovery(user.id);
+
+    // Issue secure reset token
+    const { resetToken } = createSecurityResetToken(user.id);
+
+    return res.json({
+      success: true,
+      resetToken,
+      message: 'Security answer verified successfully. You can now set a new password.',
+    });
+  } catch (error: any) {
+    console.error('[AUTH VERIFY ANSWER ERROR]', error);
+    return res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message: 'Failed to verify security answer.' });
+  }
+});
+
+// POST /api/auth/reset-password (Step 3: sets new password without requiring old password)
+app.post('/api/auth/reset-password', (req, res) => {
+  try {
+    const { resetToken, newPassword, confirmPassword } = req.body;
+
+    if (!resetToken) {
+      return res.status(400).json({ error: 'MISSING_TOKEN', message: 'Reset token is required.' });
+    }
+    if (!newPassword || newPassword.length < 8) {
+      return res.status(400).json({ error: 'WEAK_PASSWORD', message: 'New password must be at least 8 characters long.' });
+    }
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'MISMATCH', message: 'Confirm password does not match new password.' });
+    }
+
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.isValid) {
+      return res.status(400).json({ error: 'WEAK_PASSWORD', message: strength.error });
+    }
+
     resetUserPasswordWithToken(resetToken, newPassword);
     res.clearCookie('chit_session', { path: '/' });
     return res.json({
       success: true,
-      message: 'Password reset successfully. Please login again.',
+      message: 'Password reset successfully. Please login with your new password.',
     });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || 'Failed to reset password.' });
+  } catch (error: any) {
+    console.error('[AUTH RESET PASSWORD ERROR]', error);
+    return res.status(400).json({ error: 'RESET_FAILED', message: error.message || 'Failed to reset password.' });
   }
 });
-
-// ----------------- PROTECTED AUTH ROUTES -----------------
 
 // POST /api/auth/change-password
-app.post('/api/auth/change-password', authMiddleware, (req, res) => {
-  const { currentPassword, newPassword, confirmPassword } = req.body;
-  const user = (req as any).user;
-
-  if (!currentPassword || !newPassword) {
-    return res.status(400).json({ error: 'Current password and new password are required.' });
-  }
-  if (newPassword.length < 8) {
-    return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
-  }
-  if (newPassword !== confirmPassword) {
-    return res.status(400).json({ error: 'Confirm password does not match.' });
-  }
-
+// Can be called:
+// A) By authenticated session user
+// B) By user with tempToken after password expiration
+// C) With loginId + currentPassword
+app.post('/api/auth/change-password', (req, res) => {
   try {
-    changeUserPassword(user.id, currentPassword, newPassword);
-    res.clearCookie('chit_session', { path: '/' });
+    const { currentPassword, newPassword, confirmPassword, tempToken, loginId } = req.body;
+
+    if (!newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'New password and confirmation are required.' });
+    }
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'MISMATCH', message: 'Confirm password does not match new password.' });
+    }
+
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.isValid) {
+      return res.status(400).json({ error: 'WEAK_PASSWORD', message: strength.error });
+    }
+
+    let targetUserId: string | null = null;
+    let isTempTokenValid = false;
+
+    // Check tempToken
+    if (tempToken) {
+      const tempRow = verifyTempChangePasswordToken(tempToken);
+      if (tempRow) {
+        targetUserId = tempRow.user_id;
+        isTempTokenValid = true;
+      }
+    }
+
+    // Check active session
+    if (!targetUserId) {
+      const token = extractToken(req);
+      if (token) {
+        const sessionUser = verifySessionToken(token);
+        if (sessionUser) {
+          targetUserId = sessionUser.id;
+        }
+      }
+    }
+
+    // Check loginId + currentPassword
+    if (!targetUserId && loginId) {
+      const user = findUserByLoginId(loginId);
+      if (user) {
+        targetUserId = user.id;
+      }
+    }
+
+    if (!targetUserId) {
+      return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Authentication required to change password.' });
+    }
+
+    // If not verified via tempToken, currentPassword is required and verified
+    const result = changeUserPassword(targetUserId, currentPassword || null, newPassword, isTempTokenValid);
+
+    // Create a fresh session for the user so they are immediately logged in
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+    const ua = req.headers['user-agent'];
+    createSession(targetUserId, rawToken, ip, ua);
+
+    const isHttps = req.secure || (req.headers['x-forwarded-proto'] as string || '').toLowerCase() === 'https';
+    res.cookie('chit_session', rawToken, {
+      httpOnly: true,
+      secure: isHttps,
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/',
+    });
+
     return res.json({
       success: true,
-      message: 'Password changed successfully. Please login again with your new password.',
+      message: 'Password changed successfully. Welcome to Chit Manager!',
+      user: result.user,
+      token: rawToken,
     });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || 'Failed to change password.' });
+  } catch (error: any) {
+    console.error('[AUTH CHANGE PASSWORD ERROR]', error);
+    return res.status(400).json({ error: 'CHANGE_FAILED', message: error.message || 'Failed to change password.' });
   }
 });
 
-// POST /api/auth/update-security-settings
-app.post('/api/auth/update-security-settings', authMiddleware, (req, res) => {
-  const user = (req as any).user;
-  const { name, recovery_email, recovery_phone } = req.body;
-
+// POST /api/auth/security-question (Settings -> Security)
+app.post('/api/auth/security-question', authMiddleware, (req, res) => {
   try {
+    const user = (req as any).user;
+    const { currentPassword, securityQuestion, securityAnswer } = req.body;
+
+    if (!currentPassword || !securityQuestion || !securityAnswer) {
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'Current password, security question, and answer are required.' });
+    }
+
+    const result = updateUserSecurityQuestion(user.id, currentPassword, securityQuestion, securityAnswer);
+    return res.json({
+      success: true,
+      message: 'Security question configured successfully.',
+      security_question: result.security_question,
+    });
+  } catch (error: any) {
+    console.error('[AUTH SECURITY QUESTION ERROR]', error);
+    return res.status(400).json({ error: 'UPDATE_FAILED', message: error.message || 'Failed to update security question.' });
+  }
+});
+
+// POST /api/auth/update-security-settings (Settings -> Contact Details)
+app.post('/api/auth/update-security-settings', authMiddleware, (req, res) => {
+  try {
+    const user = (req as any).user;
+    const { name, recovery_email, recovery_phone } = req.body;
+
     const updated = updateUserSettings(user.id, { name, recovery_email, recovery_phone });
     return res.json({ success: true, user: updated });
-  } catch (err: any) {
-    return res.status(400).json({ error: err.message || 'Failed to update settings.' });
+  } catch (error: any) {
+    console.error('[AUTH UPDATE SETTINGS ERROR]', error);
+    return res.status(400).json({ error: 'UPDATE_FAILED', message: error.message || 'Failed to update settings.' });
   }
 });
 
@@ -287,7 +560,7 @@ app.get('/api/dashboard/stats', (req, res) => {
     const chits = db.prepare('SELECT * FROM chits ORDER BY created_at DESC').all() as any[];
     let totalPendingCurrentMonths = 0;
     const chitsSummary = chits.map(chit => {
-      const currMonth = chit.current_month || 1;
+      const currMonth = computeChitCurrentMonth(chit.start_month, chit.total_months);
       ensureMonthlyDuesForChitAndMonth(chit.id, currMonth);
 
       const chitMembersCount = db.prepare("SELECT COUNT(*) as count FROM members WHERE chit_id = ? AND status = 'active'").get(chit.id) as { count: number };
@@ -374,7 +647,7 @@ app.get('/api/chits', (req, res) => {
   try {
     const chits = db.prepare('SELECT * FROM chits ORDER BY created_at DESC').all() as any[];
     const result = chits.map(chit => {
-      const currMonth = chit.current_month || 1;
+      const currMonth = computeChitCurrentMonth(chit.start_month, chit.total_months);
       ensureMonthlyDuesForChitAndMonth(chit.id, currMonth);
 
       const memberCount = db.prepare('SELECT COUNT(*) as count FROM members WHERE chit_id = ?').get(chit.id) as { count: number };
@@ -513,10 +786,11 @@ app.get('/api/chits/:id', (req, res) => {
     ORDER BY CAST(m.ticket_number AS INTEGER) ASC, m.customer_name ASC
   `).all(chit.id) as any[];
 
-  // Selected month from query parameter or default to chit.current_month or 1
+  const computedCurrentMonth = computeChitCurrentMonth(chit.start_month, chit.total_months);
+  // Selected month from query parameter or default to computed current month
   const selectedMonth = req.query.month
     ? parseInt(req.query.month as string, 10)
-    : (chit.current_month || 1);
+    : computedCurrentMonth;
 
   ensureMonthlyDuesForChitAndMonth(chit.id, selectedMonth);
 
@@ -538,6 +812,7 @@ app.get('/api/chits/:id', (req, res) => {
 
   res.json({
     ...chit,
+    current_month: computedCurrentMonth,
     rules,
     members,
     selected_month: selectedMonth,
@@ -1183,20 +1458,52 @@ app.delete('/api/chits/:id/lift/:memberId', (req, res) => {
 
 // ----------------- PAYMENTS -----------------
 app.post('/api/payments', (req, res) => {
-  const { monthly_due_id, amount, payment_method, reference_no, notes, payment_date } = req.body;
+  const { monthly_due_id, amount, payment_method, reference_no, notes, payment_date, allow_overpayment } = req.body;
 
-  if (!monthly_due_id || !amount || amount <= 0) {
+  console.log(`[PAYMENT] Received payment request: monthly_due_id=${monthly_due_id}, amount=${amount}, method=${payment_method}`);
+
+  if (!monthly_due_id || typeof amount !== 'number' || amount <= 0 || isNaN(amount)) {
     return res.status(400).json({ error: 'Valid payment amount and due reference are required.' });
   }
 
+  // 1. Verify authenticated user
+  const user = (req as any).user;
+  if (!user) {
+    return res.status(401).json({ error: 'Unauthorized. Please login.' });
+  }
+
+  // 2. Read monthly due record
   const due = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(monthly_due_id) as any;
   if (!due) {
     return res.status(404).json({ error: 'Monthly due record not found.' });
   }
 
-  if (amount > due.balance_amount && !req.body.allow_overpayment) {
+  // 3. Verify chit exists
+  const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(due.chit_id) as any;
+  if (!chit) {
+    return res.status(404).json({ error: 'Chit fund not found.' });
+  }
+
+  // 4. Verify member belongs to chit
+  const member = db.prepare('SELECT * FROM members WHERE id = ? AND chit_id = ?').get(due.member_id, due.chit_id) as any;
+  if (!member) {
+    return res.status(404).json({ error: 'Member does not belong to this chit fund.' });
+  }
+
+  // 5. Verify month rule exists
+  const rule = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? AND month_number = ?').get(due.chit_id, due.month_number) as any;
+  if (!rule) {
+    return res.status(404).json({ error: 'Month rule not found.' });
+  }
+
+  // 6. Current outstanding calculation
+  const currentPaymentsTotalRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(monthly_due_id) as any;
+  const currentPaymentsTotal = currentPaymentsTotalRow ? Number(currentPaymentsTotalRow.total) : 0;
+  const currentBalance = Math.max(0, Number(due.due_amount) - currentPaymentsTotal);
+
+  if (amount > currentBalance && !allow_overpayment) {
     return res.status(400).json({
-      error: `Payment amount (${amount}) exceeds outstanding balance (${due.balance_amount}).`
+      error: `Payment amount (₹${amount.toLocaleString('en-IN')}) exceeds outstanding balance (₹${currentBalance.toLocaleString('en-IN')}).`
     });
   }
 
@@ -1204,8 +1511,10 @@ app.post('/api/payments', (req, res) => {
   const now = new Date().toISOString();
   const payDate = payment_date || now;
 
+  console.log(`[PAYMENT] Starting DB transaction for paymentId=${paymentId}...`);
+
   const tx = db.transaction(() => {
-    // 1. Insert payment record
+    // 7. Insert payment record into payments table
     db.prepare(`
       INSERT INTO payments (id, monthly_due_id, chit_id, member_id, month_number, month_name, amount, payment_method, reference_no, notes, payment_date, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1224,25 +1533,36 @@ app.post('/api/payments', (req, res) => {
       now
     );
 
-    // 2. Update monthly dues balance & status
-    const newPaid = due.paid_amount + amount;
-    const newBalance = Math.max(0, due.due_amount - newPaid);
-    const newStatus = newBalance === 0 ? 'PAID' : 'PARTIAL';
+    // 8. Re-aggregate authoritative total paid from payments table
+    const postPaymentRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(monthly_due_id) as any;
+    const authoritativePaid = postPaymentRow ? Number(postPaymentRow.total) : amount;
+    const newBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
+    const newStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
 
+    // 9. Update monthly dues balance & status
     db.prepare(`
       UPDATE monthly_dues
       SET paid_amount = ?, balance_amount = ?, status = ?
       WHERE id = ?
-    `).run(newPaid, newBalance, newStatus, monthly_due_id);
+    `).run(authoritativePaid, newBalance, newStatus, monthly_due_id);
+
+    console.log(`[PAYMENT] DB transaction updated monthly_dues ${monthly_due_id}: paid=${authoritativePaid}, balance=${newBalance}, status=${newStatus}`);
   });
 
   try {
     tx();
-    const updatedDue = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(monthly_due_id);
+    console.log(`[PAYMENT] DB transaction committed successfully for paymentId=${paymentId}.`);
+    const updatedDue = db.prepare(`
+      SELECT d.*, m.customer_name, m.phone, m.ticket_number
+      FROM monthly_dues d
+      JOIN members m ON d.member_id = m.id
+      WHERE d.id = ?
+    `).get(monthly_due_id);
     const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(paymentId);
-    res.status(201).json({ payment, updatedDue });
+    res.status(201).json({ payment, updatedDue, success: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    console.error(`[PAYMENT ERROR] Transaction failed for paymentId=${paymentId}:`, err);
+    res.status(500).json({ error: 'Failed to record payment in database: ' + err.message });
   }
 });
 
@@ -1269,6 +1589,189 @@ app.get('/api/payments', (req, res) => {
 
   const list = db.prepare(query).all(...params);
   res.json(list);
+});
+
+// GET all payments for a specific monthly due
+app.get('/api/dues/:dueId/payments', (req, res) => {
+  const { dueId } = req.params;
+  const payments = db.prepare(`
+    SELECT p.*, m.customer_name, m.phone, m.ticket_number, c.name as chit_name
+    FROM payments p
+    LEFT JOIN members m ON p.member_id = m.id
+    LEFT JOIN chits c ON p.chit_id = c.id
+    WHERE p.monthly_due_id = ?
+    ORDER BY p.payment_date DESC, p.created_at DESC
+  `).all(dueId);
+  res.json(payments);
+});
+
+// UPDATE an existing payment
+app.put('/api/payments/:id', (req, res) => {
+  const { id } = req.params;
+  const { amount, payment_method, reference_no, notes, payment_date } = req.body;
+
+  const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(id) as any;
+  if (!payment) {
+    return res.status(404).json({ error: 'Payment record not found.' });
+  }
+
+  const due = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(payment.monthly_due_id) as any;
+  if (!due) {
+    return res.status(404).json({ error: 'Associated monthly due record not found.' });
+  }
+
+  const newAmount = amount !== undefined ? Number(amount) : payment.amount;
+  if (isNaN(newAmount) || newAmount <= 0) {
+    return res.status(400).json({ error: 'Valid payment amount greater than 0 is required.' });
+  }
+
+  const oldAmount = Number(payment.amount);
+  const diff = newAmount - oldAmount;
+  const newPaidAmount = Math.max(0, Number(due.paid_amount) + diff);
+
+  if (newPaidAmount > due.due_amount && !req.body.allow_overpayment) {
+    const maxAllowed = Number(due.due_amount) - (Number(due.paid_amount) - oldAmount);
+    return res.status(400).json({
+      error: `New payment amount exceeds due balance. Maximum allowed amount is ${maxAllowed}.`
+    });
+  }
+
+  const newBalanceAmount = Math.max(0, Number(due.due_amount) - newPaidAmount);
+  const newStatus = newPaidAmount >= due.due_amount ? 'PAID' : (newPaidAmount > 0 ? 'PARTIAL' : 'PENDING');
+
+  const newMethod = payment_method || payment.payment_method || 'Cash';
+  const newRef = reference_no !== undefined ? reference_no : payment.reference_no;
+  const newNotes = notes !== undefined ? notes : payment.notes;
+  const newDate = payment_date || payment.payment_date;
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      UPDATE payments
+      SET amount = ?, payment_method = ?, reference_no = ?, notes = ?, payment_date = ?
+      WHERE id = ?
+    `).run(newAmount, newMethod, newRef, newNotes, newDate, id);
+
+    // Re-aggregate authoritative sum from payments table
+    const postRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(due.id) as any;
+    const authoritativePaid = postRow ? Number(postRow.total) : newPaidAmount;
+    const finalBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
+    const finalStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
+
+    db.prepare(`
+      UPDATE monthly_dues
+      SET paid_amount = ?, balance_amount = ?, status = ?
+      WHERE id = ?
+    `).run(authoritativePaid, finalBalance, finalStatus, due.id);
+  });
+
+  try {
+    tx();
+    const updatedPayment = db.prepare('SELECT * FROM payments WHERE id = ?').get(id);
+    const updatedDue = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(due.id);
+    console.log(`[PAYMENT EDIT] Successfully updated payment ${id} and monthly_dues ${due.id}`);
+    res.json({ success: true, payment: updatedPayment, updatedDue });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE / REVERT an existing payment
+app.delete('/api/payments/:id', (req, res) => {
+  const { id } = req.params;
+
+  const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(id) as any;
+  if (!payment) {
+    return res.status(404).json({ error: 'Payment record not found.' });
+  }
+
+  const due = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(payment.monthly_due_id) as any;
+  if (!due) {
+    return res.status(404).json({ error: 'Associated monthly due record not found.' });
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM payments WHERE id = ?').run(id);
+
+    // Re-aggregate authoritative sum from payments table
+    const postRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(due.id) as any;
+    const authoritativePaid = postRow ? Number(postRow.total) : 0;
+    const finalBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
+    const finalStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
+
+    db.prepare(`
+      UPDATE monthly_dues
+      SET paid_amount = ?, balance_amount = ?, status = ?
+      WHERE id = ?
+    `).run(authoritativePaid, finalBalance, finalStatus, due.id);
+  });
+
+  try {
+    tx();
+    const updatedDue = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(due.id);
+    console.log(`[PAYMENT DELETE] Successfully deleted payment ${id} and synced monthly_dues ${due.id}`);
+    res.json({ success: true, message: 'Payment record removed and due balance updated.', updatedDue });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------- PENDING DUES ROUTE -----------------
+app.get('/api/dues/pending', (req, res) => {
+  try {
+    const { chit_id, current_only } = req.query;
+    const isCurrentOnly = current_only !== 'false';
+
+    // Ensure monthly dues are generated for active chits
+    const activeChits = db.prepare("SELECT id, current_month FROM chits WHERE status = 'active'").all() as any[];
+    for (const c of activeChits) {
+      ensureMonthlyDuesForChitAndMonth(c.id, c.current_month || 1);
+    }
+
+    let sql = `
+      SELECT 
+        d.*,
+        c.name as chit_name,
+        c.current_month as chit_current_month,
+        m.customer_name,
+        m.phone,
+        m.ticket_number,
+        l.lift_month,
+        CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status
+      FROM monthly_dues d
+      JOIN chits c ON d.chit_id = c.id
+      JOIN members m ON d.member_id = m.id
+      LEFT JOIN lift_details l ON d.member_id = l.member_id
+      WHERE d.balance_amount > 0 AND c.status = 'active'
+    `;
+
+    const params: any[] = [];
+    if (chit_id) {
+      sql += ' AND d.chit_id = ?';
+      params.push(chit_id);
+    }
+
+    if (isCurrentOnly) {
+      sql += ' AND d.month_number = c.current_month';
+    }
+
+    sql += ' ORDER BY c.name ASC, CAST(m.ticket_number AS INTEGER) ASC, m.customer_name ASC';
+
+    const dues = db.prepare(sql).all(...params) as any[];
+
+    const totalPendingAmount = dues.reduce((sum, d) => sum + (d.balance_amount || 0), 0);
+    const totalPendingMembers = dues.length;
+
+    res.json({
+      dues,
+      summary: {
+        totalPendingMembers,
+        totalPendingAmount
+      }
+    });
+  } catch (err: any) {
+    console.error('Pending dues error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ----------------- REPORTS -----------------
@@ -1372,6 +1875,25 @@ app.get('/api/search', (req, res) => {
   `).all(`%${query}%`, `%${query}%`, `%${query}%`, `%${query}%`);
 
   res.json(results);
+});
+
+// 404 handler for unrecognized API endpoints
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ error: 'Endpoint not found.' });
+});
+
+// Global unhandled error handler for API requests
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('[UNHANDLED ERROR]', err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  if (req.path.startsWith('/api/')) {
+    return res.status(err.status || 500).json({
+      error: 'An unexpected server error occurred. Please try again.',
+    });
+  }
+  next(err);
 });
 
 // ----------------- VITE MIDDLEWARE / STATIC ASSETS -----------------
