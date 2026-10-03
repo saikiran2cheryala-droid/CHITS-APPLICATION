@@ -9,6 +9,7 @@ import {
   ChevronRight,
   AlertCircle,
   Sparkles,
+  Download,
 } from 'lucide-react';
 
 interface QuickActionsFloatingMenuProps {
@@ -16,6 +17,7 @@ interface QuickActionsFloatingMenuProps {
   onOpenDueMembers: () => void;
   onOpenNewChit: () => void;
   onOpenSearch: () => void;
+  onExportCSV?: () => void;
   pendingDueCount?: number;
 }
 
@@ -24,6 +26,7 @@ export const QuickActionsFloatingMenu: React.FC<QuickActionsFloatingMenuProps> =
   onOpenDueMembers,
   onOpenNewChit,
   onOpenSearch,
+  onExportCSV,
   pendingDueCount,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -53,13 +56,17 @@ export const QuickActionsFloatingMenu: React.FC<QuickActionsFloatingMenuProps> =
           e.preventDefault();
           setIsOpen(false);
           onOpenSearch();
+        } else if ((e.key.toLowerCase() === 'e' || e.key === '5') && onExportCSV) {
+          e.preventDefault();
+          setIsOpen(false);
+          onExportCSV();
         }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onOpenRecordPayment, onOpenDueMembers, onOpenNewChit, onOpenSearch]);
+  }, [isOpen, onOpenRecordPayment, onOpenDueMembers, onOpenNewChit, onOpenSearch, onExportCSV]);
 
   const actions = [
     {
@@ -122,6 +129,25 @@ export const QuickActionsFloatingMenu: React.FC<QuickActionsFloatingMenuProps> =
         onOpenSearch();
       },
     },
+    ...(onExportCSV
+      ? [
+          {
+            id: 'export-csv',
+            title: 'Export Report (CSV)',
+            subtitle: 'Download dashboard stats & chit ledger',
+            icon: Download,
+            badge: 'CSV',
+            badgeColor: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+            iconBg: 'bg-emerald-600 text-white',
+            accentHover: 'hover:border-emerald-400 hover:bg-emerald-50/30',
+            shortcut: 'E',
+            onClick: () => {
+              setIsOpen(false);
+              onExportCSV();
+            },
+          },
+        ]
+      : []),
   ];
 
   return (

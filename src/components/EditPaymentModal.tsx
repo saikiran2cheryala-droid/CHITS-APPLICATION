@@ -122,12 +122,16 @@ export const EditPaymentModal: React.FC<EditPaymentModalProps> = ({
     try {
       setIsSubmitting(true);
       setError(null);
+      const safePaymentDate = paymentDate
+        ? (paymentDate.includes('T') ? paymentDate : `${paymentDate}T12:00:00.000Z`)
+        : new Date().toISOString();
+
       await api.payments.update(selectedPayment.id, {
         amount,
         payment_method: method,
         reference_no: referenceNo.trim() || '',
         notes: notes.trim() || '',
-        payment_date: paymentDate ? new Date(paymentDate).toISOString() : new Date().toISOString(),
+        payment_date: safePaymentDate,
       });
       onSuccess();
       onClose();

@@ -32,15 +32,22 @@ import {
   updateUserSecurityQuestion,
   validatePasswordStrength,
   computeChitCurrentMonth,
+  syncChitsCurrentMonth,
 } from './server/db.ts';
 import { sendPasswordRecoveryEmail } from './server/email.ts';
 
 // Initialize SQLite DB & ensure initial admin exists
 initDatabase();
+syncChitsCurrentMonth();
 
 const app = express();
 app.set('trust proxy', 1);
-const PORT = Number(process.env.PORT || 3000);
+
+// Determine port: dev server must run on port 3000 (control-plane-api and nginx reverse proxy expects 3000)
+const args = process.argv.slice(2);
+const portArgIndex = args.indexOf('--port');
+const portFromArgs = portArgIndex !== -1 && args[portArgIndex + 1] ? Number(args[portArgIndex + 1]) : null;
+const PORT = portFromArgs || (process.env.NODE_ENV === 'production' ? Number(process.env.PORT || 3000) : 3000);
 
 app.use(express.json());
 app.use(cookieParser());
@@ -538,6 +545,60 @@ app.post('/api/auth/update-security-settings', authMiddleware, (req, res) => {
 // ----------------- PROTECT ALL APPLICATION API ROUTES -----------------
 app.use('/api', authMiddleware);
 
+// ----------------- CHIT FULL-TERM PROFIT PROJECTION -----------------
+// Pure projection calculated solely from configured chit rules and duration.
+// Customer payments received or pending dues MUST NOT change this value.
+export function calculateChitFullTermProjection(chit: any) {
+  const rules = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? ORDER BY month_number ASC').all(chit.id) as any[];
+  const totalMonths = Number(chit.total_months) || rules.length || 0;
+  const totalMembers = Number(chit.total_members) || 0;
+
+  let totalProjectedCollection = 0;
+  let totalProjectedLiftPayout = 0;
+  let totalProjectedProfit = 0;
+  const monthlyProjections: any[] = [];
+
+  for (let m = 1; m <= totalMonths; m++) {
+    const rule = rules.find((r: any) => r.month_number === m) || {};
+    const preAmount = Number(rule.pre_lift_payment) || 0;
+    const postAmount = Number(rule.post_lift_payment) || 0;
+    const liftPayout = Number(rule.expected_lift_payout) || 0;
+
+    // (m - 1) members have already lifted in earlier months and pay post-lift due.
+    // The remaining members pay pre-lift due.
+    const postLiftCount = Math.max(0, Math.min(m - 1, totalMembers));
+    const preLiftCount = Math.max(0, totalMembers - postLiftCount);
+
+    const projectedCollection = (preLiftCount * preAmount) + (postLiftCount * postAmount);
+    const profitOrLoss = projectedCollection - liftPayout;
+
+    totalProjectedCollection += projectedCollection;
+    totalProjectedLiftPayout += liftPayout;
+    totalProjectedProfit += profitOrLoss;
+
+    monthlyProjections.push({
+      month_number: m,
+      month_name: rule.month_name || `Month ${m}`,
+      pre_lift_payment: preAmount,
+      post_lift_payment: postAmount,
+      pre_lift_count: preLiftCount,
+      post_lift_count: postLiftCount,
+      projected_collection: projectedCollection,
+      lift_payout: liftPayout,
+      profit_or_loss: profitOrLoss,
+      is_profit: profitOrLoss >= 0,
+      manager_add_required: profitOrLoss < 0 ? Math.abs(profitOrLoss) : 0
+    });
+  }
+
+  return {
+    total_projected_collection: totalProjectedCollection,
+    total_projected_lift_payout: totalProjectedLiftPayout,
+    total_projected_profit: totalProjectedProfit,
+    monthly_projections: monthlyProjections
+  };
+}
+
 // ----------------- DASHBOARD STATS -----------------
 app.get('/api/dashboard/stats', (req, res) => {
   try {
@@ -559,6 +620,15 @@ app.get('/api/dashboard/stats', (req, res) => {
     // Chit summary cards (calculated strictly for each chit's current month)
     const chits = db.prepare('SELECT * FROM chits ORDER BY created_at DESC').all() as any[];
     let totalPendingCurrentMonths = 0;
+    let totalDueCurrentMonths = 0;
+    let totalCollectedCurrentMonths = 0;
+    let totalActualCurrentMonthProfit = 0; // Actual collection - Lift payout for current month
+    let totalProjectedChitProfit = 0; // Full-term complete projected profit across active chits
+    let totalProjectedChitCollection = 0;
+    let totalProjectedChitPayout = 0;
+    const projectedProfitBreakdown: any[] = [];
+    const currentMonthProfitBreakdown: any[] = [];
+
     const chitsSummary = chits.map(chit => {
       const currMonth = computeChitCurrentMonth(chit.start_month, chit.total_months);
       ensureMonthlyDuesForChitAndMonth(chit.id, currMonth);
@@ -578,8 +648,57 @@ app.get('/api/dashboard/stats', (req, res) => {
 
       const liftedCount = db.prepare('SELECT COUNT(*) as count FROM lift_details WHERE chit_id = ?').get(chit.id) as { count: number };
 
+      // Calculate actual profit for current month (money actually collected - actual payout)
+      const rule = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? AND month_number = ?').get(chit.id, currMonth) as any;
+      const lift = db.prepare(`
+        SELECT l.*, m.customer_name, m.ticket_number 
+        FROM lift_details l
+        JOIN members m ON l.member_id = m.id
+        WHERE l.chit_id = ? AND l.lift_month = ?
+      `).get(chit.id, currMonth) as any;
+
+      const liftPayout = lift
+        ? (Number(lift.lift_amount_received) || 0)
+        : (rule ? (Number(rule.expected_lift_payout) || Number(rule.monthly_chit_value) || 0) : 0);
+
+      const actualCurrentMonthProfit = monthStats.total_collected - liftPayout;
+
+      // Calculate FULL-TERM COMPLETE PROJECTED PROFIT (independent of customer payments!)
+      const fullTermProj = calculateChitFullTermProjection(chit);
+
       if (chit.status === 'active') {
+        totalDueCurrentMonths += monthStats.total_due;
+        totalCollectedCurrentMonths += monthStats.total_collected;
         totalPendingCurrentMonths += monthStats.total_pending;
+        totalActualCurrentMonthProfit += actualCurrentMonthProfit;
+
+        totalProjectedChitProfit += fullTermProj.total_projected_profit;
+        totalProjectedChitCollection += fullTermProj.total_projected_collection;
+        totalProjectedChitPayout += fullTermProj.total_projected_lift_payout;
+
+        projectedProfitBreakdown.push({
+          chit_id: chit.id,
+          chit_name: chit.name,
+          chit_value: chit.chit_value,
+          total_months: chit.total_months,
+          total_members: chit.total_members,
+          status: chit.status,
+          total_projected_profit: fullTermProj.total_projected_profit,
+          total_projected_collection: fullTermProj.total_projected_collection,
+          total_projected_payout: fullTermProj.total_projected_lift_payout,
+          monthly_projections: fullTermProj.monthly_projections
+        });
+
+        currentMonthProfitBreakdown.push({
+          chit_id: chit.id,
+          chit_name: chit.name,
+          current_month: currMonth,
+          total_due: monthStats.total_due,
+          total_collected: monthStats.total_collected,
+          total_pending: monthStats.total_pending,
+          lift_payout: liftPayout,
+          profit: actualCurrentMonthProfit
+        });
       }
 
       return {
@@ -590,7 +709,12 @@ app.get('/api/dashboard/stats', (req, res) => {
         total_collected: monthStats.total_collected,
         total_due: monthStats.total_due,
         lifted_members_count: liftedCount.count,
-        current_month: currMonth
+        current_month: currMonth,
+        profit: actualCurrentMonthProfit,
+        total_projected_profit: fullTermProj.total_projected_profit,
+        total_projected_collection: fullTermProj.total_projected_collection,
+        total_projected_payout: fullTermProj.total_projected_lift_payout,
+        projected_monthly: fullTermProj.monthly_projections
       };
     });
 
@@ -611,14 +735,14 @@ app.get('/api/dashboard/stats', (req, res) => {
       SELECT COALESCE(SUM(amount), 0) as total FROM payments
     `).get() as { total: number };
 
-    // Recent payments
+    // Recent payments (ordered by most recent update or creation)
     const recentPayments = db.prepare(`
       SELECT p.*, m.customer_name, m.ticket_number, c.name as chit_name
       FROM payments p
       JOIN members m ON p.member_id = m.id
       JOIN chits c ON p.chit_id = c.id
-      ORDER BY p.payment_date DESC, p.created_at DESC
-      LIMIT 10
+      ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.payment_date DESC, p.created_at DESC
+      LIMIT 15
     `).all();
 
     res.json({
@@ -627,9 +751,23 @@ app.get('/api/dashboard/stats', (req, res) => {
         totalMembers: membersCount.count,
         todayCollection: todayColl.total,
         thisMonthCollection: monthColl.total,
+        totalDue: totalDueCurrentMonths,
+        totalCollection: totalCollectedCurrentMonths,
+        totalPending: totalPendingCurrentMonths,
         totalPendingAmount: totalPendingCurrentMonths,
         totalOutstanding,
         totalCollected: totalCollAllTime.total,
+        // TOTAL PROJECTED CHIT PROFIT (Full-term complete projected profit across active chits)
+        totalProjectedChitProfit,
+        totalProjectedCollection: totalProjectedChitCollection,
+        totalProjectedLiftPayout: totalProjectedChitPayout,
+        projectedProfitBreakdown,
+        // ACTUAL CURRENT MONTH PROFIT (Money collected - lift payout for current month)
+        actualCurrentMonthProfit: totalActualCurrentMonthProfit,
+        currentMonthProfitBreakdown,
+        // Legacy alias for compatibility
+        totalAssumedProfit: totalProjectedChitProfit,
+        assumedProfitBreakdown: projectedProfitBreakdown,
         totalPaidCustomers: paidCust.count,
         totalPendingCustomers: pendingCust.count,
         recentPayments
@@ -694,10 +832,11 @@ app.post('/api/chits', (req, res) => {
 
   const chitId = 'chit-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const now = new Date().toISOString();
+  const computedCurrentMonth = computeChitCurrentMonth(start_month, total_months);
 
   const insertChit = db.prepare(`
-    INSERT INTO chits (id, name, chit_value, total_months, total_members, start_month, end_month, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    INSERT INTO chits (id, name, chit_value, total_months, total_members, start_month, end_month, status, current_month, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
   `);
 
   const insertRule = db.prepare(`
@@ -717,7 +856,7 @@ app.post('/api/chits', (req, res) => {
 
   const tx = db.transaction(() => {
     // 1. Insert Chit
-    insertChit.run(chitId, name, chit_value, total_months, total_members, start_month, end_month, now, now);
+    insertChit.run(chitId, name, chit_value, total_months, total_members, start_month, end_month, computedCurrentMonth, now, now);
 
     // 2. Insert Month Rules
     for (const rule of rules) {
@@ -776,7 +915,7 @@ app.get('/api/chits/:id', (req, res) => {
 
   const rules = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? ORDER BY month_number ASC').all(chit.id);
   const members = db.prepare(`
-    SELECT m.*, l.id as lift_id, l.lift_month, l.lift_amount_received, l.lift_amount_received as lift_amount,
+    SELECT m.*, l.id as lift_id, l.lift_month, l.lift_amount, l.lift_amount_received, l.remaining_payout, l.payout_status,
            l.lift_date, l.payment_method, l.reference_number, l.notes as lift_notes, l.status as lift_status_text,
            l.created_at as lift_created_at, l.updated_at as lift_updated_at,
            CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status
@@ -810,6 +949,18 @@ app.get('/api/chits/:id', (req, res) => {
   const liftedCount = members.filter((m: any) => m.lift_status === 'lifted').length;
   const unliftedCount = members.length - liftedCount;
 
+  // Attach transactions to lifted members
+  for (const m of members) {
+    if (m.lift_id) {
+      m.transactions = db.prepare('SELECT * FROM lift_payout_transactions WHERE lift_id = ? ORDER BY payment_date ASC, created_at ASC').all(m.lift_id);
+    } else {
+      m.transactions = [];
+    }
+  }
+
+  // Calculate Full-term complete projected profit (independent of payments!)
+  const fullTermProj = calculateChitFullTermProjection(chit);
+
   res.json({
     ...chit,
     current_month: computedCurrentMonth,
@@ -823,6 +974,25 @@ app.get('/api/chits/:id', (req, res) => {
     pending_members_count: monthStats.pending_members_count,
     lifted_members_count: liftedCount,
     unlifted_members_count: unliftedCount,
+    total_projected_profit: fullTermProj.total_projected_profit,
+    total_projected_collection: fullTermProj.total_projected_collection,
+    total_projected_payout: fullTermProj.total_projected_lift_payout,
+    projected_monthly: fullTermProj.monthly_projections,
+  });
+});
+
+app.get('/api/chits/:id/projection', (req, res) => {
+  const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(req.params.id) as any;
+  if (!chit) return res.status(404).json({ error: 'Chit not found' });
+  const fullTermProj = calculateChitFullTermProjection(chit);
+  res.json({
+    chit_id: chit.id,
+    chit_name: chit.name,
+    chit_value: chit.chit_value,
+    total_months: chit.total_months,
+    total_members: chit.total_members,
+    status: chit.status,
+    ...fullTermProj
   });
 });
 
@@ -1002,14 +1172,29 @@ app.get('/api/chits/:id/months/:monthNumber', (req, res) => {
 
   const dues = db.prepare(`
     SELECT d.*, m.customer_name, m.phone, m.ticket_number,
-           l.lift_month, l.lift_amount_received,
-           CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status
+           l.id as lift_id, l.lift_month, l.lift_amount, l.lift_amount_received, l.remaining_payout, l.payout_status, l.lift_date,
+           CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status,
+           (SELECT p.payment_method FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_method,
+           (SELECT p.payment_date FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_date,
+           (SELECT p.reference_no FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_reference,
+           (SELECT p.notes FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_notes,
+           (SELECT p.amount FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_amount,
+           (SELECT COALESCE(p.updated_at, p.created_at) FROM payments p WHERE (p.monthly_due_id = d.id OR (p.chit_id = d.chit_id AND p.member_id = d.member_id AND p.month_number = d.month_number)) ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.created_at DESC LIMIT 1) as last_payment_updated_at
     FROM monthly_dues d
     JOIN members m ON d.member_id = m.id
     LEFT JOIN lift_details l ON m.id = l.member_id
     WHERE d.chit_id = ? AND d.month_number = ? AND m.status = 'active'
     ORDER BY CAST(m.ticket_number AS INTEGER) ASC, m.customer_name ASC
   `).all(chitId, monthNumber) as any[];
+
+  // Fetch all payment transactions for this specific chit and month (ordered by last updated/created)
+  const payments = db.prepare(`
+    SELECT p.*, m.customer_name, m.phone, m.ticket_number
+    FROM payments p
+    JOIN members m ON p.member_id = m.id
+    WHERE p.chit_id = ? AND p.month_number = ?
+    ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.payment_date DESC, p.created_at DESC
+  `).all(chitId, monthNumber);
 
   const stats = db.prepare(`
     SELECT 
@@ -1030,26 +1215,62 @@ app.get('/api/chits/:id/months/:monthNumber', (req, res) => {
     WHERE l.chit_id = ? AND l.lift_month = ?
   `).get(chitId, monthNumber) as any;
 
-  // Monthly Profit calculation: Total actual collection for month minus actual lift payout for month
-  const total_collection = Number(stats.total_paid) || 0;
-  const profit_details = lift ? {
-    has_lift: true,
+  // 1. Calculate PROJECTED MONTHLY PROFIT (Strictly configured rules, independent of payments received)
+  const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(chitId) as any;
+  const fullTermProj = calculateChitFullTermProjection(chit);
+  const monthProj = fullTermProj.monthly_projections.find((p: any) => p.month_number === monthNumber);
+
+  const totalMembers = Number(chit?.total_members) || 0;
+  const preAmount = Number(rule.pre_lift_payment) || 0;
+  const postAmount = Number(rule.post_lift_payment) || 0;
+  const postLiftCount = Math.max(0, Math.min(monthNumber - 1, totalMembers));
+  const preLiftCount = Math.max(0, totalMembers - postLiftCount);
+  const projectedCollection = monthProj
+    ? monthProj.projected_collection
+    : ((preLiftCount * preAmount) + (postLiftCount * postAmount));
+  const configuredLiftPayout = Number(rule.expected_lift_payout) || Number(rule.monthly_chit_value) || Number(chit?.chit_value) || 0;
+  const projectedProfit = projectedCollection - configuredLiftPayout;
+  const managerAddRequired = projectedProfit < 0 ? Math.abs(projectedProfit) : 0;
+
+  // 2. Calculate ACTUAL MONTHLY PROFIT (Based strictly on actual cash collected from customer payments)
+  const actualCollection = Number(stats.total_paid) || 0;
+  const actualLiftPayout = lift
+    ? (Number(lift.lift_amount_received) || 0)
+    : configuredLiftPayout;
+  const actualProfit = actualCollection - actualLiftPayout;
+  const actualManagerAddRequired = actualProfit < 0 ? Math.abs(actualProfit) : 0;
+
+  const profit_details = {
+    has_lift: Boolean(lift),
+    is_projected: !lift,
     month_number: monthNumber,
     month_name: rule.month_name,
-    total_collection,
-    lift_payout: Number(lift.lift_amount_received) || 0,
-    profit: total_collection - (Number(lift.lift_amount_received) || 0),
-    lifted_member_name: lift.customer_name,
-    ticket_number: lift.ticket_number
-  } : {
-    has_lift: false,
-    month_number: monthNumber,
-    month_name: rule.month_name,
-    total_collection,
-    lift_payout: null,
-    profit: null,
-    lifted_member_name: null,
-    ticket_number: null
+
+    // PROJECTED MONTHLY PROFIT (Configured rules only, independent of payments)
+    projected_collection: projectedCollection,
+    configured_lift_payout: configuredLiftPayout,
+    projected_profit: projectedProfit,
+    is_profit: projectedProfit >= 0,
+    manager_add_required: managerAddRequired,
+    pre_lift_payment: preAmount,
+    post_lift_payment: postAmount,
+    pre_lift_count: preLiftCount,
+    post_lift_count: postLiftCount,
+    total_members: totalMembers,
+
+    // ACTUAL MONTHLY PROFIT (Money received so far)
+    actual_collection: actualCollection,
+    actual_lift_payout: actualLiftPayout,
+    actual_profit: actualProfit,
+    actual_manager_add_required: actualManagerAddRequired,
+
+    // Primary profit field is set to projected_profit so all UI displays projected profit
+    profit: projectedProfit,
+    total_collection: projectedCollection,
+    total_due: Number(stats.total_due) || projectedCollection,
+    lift_payout: configuredLiftPayout,
+    lifted_member_name: lift ? lift.customer_name : null,
+    ticket_number: lift ? lift.ticket_number : null
   };
 
   res.json({
@@ -1057,7 +1278,8 @@ app.get('/api/chits/:id/months/:monthNumber', (req, res) => {
     dues,
     stats,
     lift: lift || null,
-    profit: profit_details
+    profit: profit_details,
+    payments
   });
 });
 
@@ -1068,8 +1290,28 @@ app.get('/api/chits/:id/months/:monthNumber/profit', (req, res) => {
 
   ensureMonthlyDuesForChitAndMonth(chitId, monthNumber);
 
+  const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(chitId) as any;
+  if (!chit) return res.status(404).json({ error: 'Chit not found' });
+
   const rule = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? AND month_number = ?').get(chitId, monthNumber) as any;
   const monthName = rule ? rule.month_name : `Month ${monthNumber}`;
+
+  const fullTermProj = calculateChitFullTermProjection(chit);
+  const monthProj = fullTermProj.monthly_projections.find((p: any) => p.month_number === monthNumber);
+
+  const totalMembers = Number(chit?.total_members) || 0;
+  const preAmount = rule ? Number(rule.pre_lift_payment) || 0 : 0;
+  const postAmount = rule ? Number(rule.post_lift_payment) || 0 : 0;
+  const postLiftCount = Math.max(0, Math.min(monthNumber - 1, totalMembers));
+  const preLiftCount = Math.max(0, totalMembers - postLiftCount);
+  const projectedCollection = monthProj
+    ? monthProj.projected_collection
+    : ((preLiftCount * preAmount) + (postLiftCount * postAmount));
+  const configuredLiftPayout = rule
+    ? (Number(rule.expected_lift_payout) || Number(rule.monthly_chit_value) || Number(chit.chit_value) || 0)
+    : 0;
+  const projectedProfit = projectedCollection - configuredLiftPayout;
+  const managerAddRequired = projectedProfit < 0 ? Math.abs(projectedProfit) : 0;
 
   // Actual payments collected from all members for that month
   const collectionRow = db.prepare(`
@@ -1078,7 +1320,7 @@ app.get('/api/chits/:id/months/:monthNumber/profit', (req, res) => {
     WHERE chit_id = ? AND month_number = ?
   `).get(chitId, monthNumber) as { total_collection: number };
 
-  const total_collection = collectionRow ? Number(collectionRow.total_collection) : 0;
+  const actualCollection = collectionRow ? Number(collectionRow.total_collection) : 0;
 
   // Lifted customer for that month
   const lift = db.prepare(`
@@ -1088,38 +1330,49 @@ app.get('/api/chits/:id/months/:monthNumber/profit', (req, res) => {
     WHERE l.chit_id = ? AND l.lift_month = ?
   `).get(chitId, monthNumber) as any;
 
-  if (!lift) {
-    return res.json({
-      month_number: monthNumber,
-      month_name: monthName,
-      total_collection,
-      lift_payout: null,
-      profit: null,
-      has_lift: false,
-      lifted_member_name: null,
-      ticket_number: null
-    });
-  }
-
-  const lift_payout = Number(lift.lift_amount_received) || 0;
-  const profit = total_collection - lift_payout;
+  const actualLiftPayout = lift
+    ? (Number(lift.lift_amount_received) || 0)
+    : configuredLiftPayout;
+  const actualProfit = actualCollection - actualLiftPayout;
 
   return res.json({
     month_number: monthNumber,
     month_name: monthName,
-    total_collection,
-    lift_payout,
-    profit,
-    has_lift: true,
-    lifted_member_name: lift.customer_name,
-    ticket_number: lift.ticket_number
+    // 1. PROJECTED MONTHLY PROFIT
+    projected_collection: projectedCollection,
+    configured_lift_payout: configuredLiftPayout,
+    projected_profit: projectedProfit,
+    is_profit: projectedProfit >= 0,
+    manager_add_required: managerAddRequired,
+    pre_lift_payment: preAmount,
+    post_lift_payment: postAmount,
+    pre_lift_count: preLiftCount,
+    post_lift_count: postLiftCount,
+    total_members: totalMembers,
+
+    // 2. ACTUAL MONTHLY PROFIT
+    actual_collection: actualCollection,
+    actual_lift_payout: actualLiftPayout,
+    actual_profit: actualProfit,
+    actual_manager_add_required: actualProfit < 0 ? Math.abs(actualProfit) : 0,
+
+    // Primary profit field
+    profit: projectedProfit,
+    total_collection: projectedCollection,
+    lift_payout: configuredLiftPayout,
+    has_lift: Boolean(lift),
+    is_projected: !lift,
+    lifted_member_name: lift ? lift.customer_name : null,
+    ticket_number: lift ? lift.ticket_number : null
   });
 });
 
 // ----------------- MEMBERS CRUD -----------------
 app.get('/api/chits/:id/members', (req, res) => {
   const members = db.prepare(`
-    SELECT m.*, l.lift_month, l.lift_amount_received, l.lift_date, l.notes as lift_notes,
+    SELECT m.*, l.lift_month, l.lift_amount, l.lift_amount_received, l.remaining_payout, l.payout_status,
+           l.lift_date, l.notes as lift_notes, l.payment_method as lift_payment_method, l.payment_method,
+           l.reference_number as lift_reference_number, l.reference_number,
            CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status,
            (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE member_id = m.id) as total_paid,
            (SELECT COALESCE(SUM(balance_amount), 0) FROM monthly_dues WHERE member_id = m.id) as total_pending
@@ -1316,7 +1569,7 @@ app.delete('/api/members/:id', (req, res) => {
 app.get('/api/members/:id/profile', (req, res) => {
   const member = db.prepare(`
     SELECT m.*, c.name as chit_name, c.chit_value, c.total_months, c.start_month, c.end_month,
-           l.id as lift_id, l.lift_month, l.lift_amount_received, l.lift_amount_received as lift_amount,
+           l.id as lift_id, l.lift_month, l.lift_amount, l.lift_amount_received, l.remaining_payout, l.payout_status,
            l.lift_date, l.payment_method as lift_payment_method, l.payment_method,
            l.reference_number as lift_reference_number, l.reference_number,
            l.notes as lift_notes, l.status as lift_status_text,
@@ -1338,23 +1591,30 @@ app.get('/api/members/:id/profile', (req, res) => {
     SELECT * FROM payments WHERE member_id = ? ORDER BY payment_date DESC, created_at DESC
   `).all(member.id);
 
+  let liftTransactions: any[] = [];
+  if (member.lift_id) {
+    liftTransactions = db.prepare('SELECT * FROM lift_payout_transactions WHERE lift_id = ? ORDER BY payment_date ASC, created_at ASC').all(member.lift_id);
+  }
+
   const totalPaid = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE member_id = ?').get(member.id) as { total: number };
   const totalOutstanding = db.prepare('SELECT COALESCE(SUM(balance_amount), 0) as total FROM monthly_dues WHERE member_id = ?').get(member.id) as { total: number };
 
   res.json({
-    member,
+    member: {
+      ...member,
+      transactions: liftTransactions
+    },
     dues,
     payments,
+    lift_transactions: liftTransactions,
     total_paid: totalPaid.total,
     total_outstanding: totalOutstanding.total
   });
 });
 
-// Helper for saving or updating lift details
+// Helper for saving or updating lift details with partial payout support
 function handleSaveLift(chitId: string, memberId: string, body: any, res: any) {
-  const { lift_month, lift_amount_received, lift_amount, lift_date, payment_method, reference_number, notes } = body;
-  const rawAmount = lift_amount !== undefined ? lift_amount : lift_amount_received;
-  const finalAmount = Number(rawAmount);
+  const { lift_month, lift_date, payment_method, reference_number, notes } = body;
 
   if (!memberId) {
     return res.status(400).json({ error: 'Please select a customer.' });
@@ -1365,9 +1625,6 @@ function handleSaveLift(chitId: string, memberId: string, body: any, res: any) {
   if (!lift_date || String(lift_date).trim() === '') {
     return res.status(400).json({ error: 'Please select lift date.' });
   }
-  if (isNaN(finalAmount) || finalAmount <= 0) {
-    return res.status(400).json({ error: 'Please enter a valid lift amount.' });
-  }
   if (!payment_method || String(payment_method).trim() === '') {
     return res.status(400).json({ error: 'Please select payment method.' });
   }
@@ -1376,6 +1633,34 @@ function handleSaveLift(chitId: string, memberId: string, body: any, res: any) {
   const existingLift = db.prepare('SELECT * FROM lift_details WHERE chit_id = ? AND lift_month = ?').get(chitId, parsedMonth) as any;
   if (existingLift && existingLift.member_id !== memberId) {
     return res.status(400).json({ error: `Month ${parsedMonth} is already assigned to another customer.` });
+  }
+
+  // Configured Lift Payout (e.g. ₹5,00,000)
+  const configuredPayout = Number(
+    body.lift_amount !== undefined
+      ? body.lift_amount
+      : (body.configured_lift_payout !== undefined ? body.configured_lift_payout : body.lift_amount_received)
+  );
+
+  if (isNaN(configuredPayout) || configuredPayout <= 0) {
+    return res.status(400).json({ error: 'Please enter a valid configured lift payout amount greater than zero.' });
+  }
+
+  // Initial Amount Paid to Customer (e.g. ₹3,00,000)
+  const initialPaid = Number(
+    body.initial_amount_paid !== undefined
+      ? body.initial_amount_paid
+      : (body.lift_amount_received !== undefined ? body.lift_amount_received : configuredPayout)
+  );
+
+  if (isNaN(initialPaid) || initialPaid < 0) {
+    return res.status(400).json({ error: 'Initial payout amount cannot be negative.' });
+  }
+
+  if (initialPaid > configuredPayout) {
+    return res.status(400).json({
+      error: `Initial payment cannot exceed the configured lift payout of ₹${new Intl.NumberFormat('en-IN').format(configuredPayout)}.`
+    });
   }
 
   const existingMemberLift = db.prepare('SELECT * FROM lift_details WHERE member_id = ?').get(memberId) as any;
@@ -1388,16 +1673,48 @@ function handleSaveLift(chitId: string, memberId: string, body: any, res: any) {
 
   const tx = db.transaction(() => {
     if (existingMemberLift) {
+      // If editing existing lift:
+      // Check existing transactions in lift_payout_transactions
+      const existingTxCount = db.prepare('SELECT count(*) as count FROM lift_payout_transactions WHERE lift_id = ?').get(id) as { count: number };
+      let finalPaid = initialPaid;
+
+      if (existingTxCount.count > 0) {
+        // If there are transactions already, calculate total from transactions
+        const sumRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM lift_payout_transactions WHERE lift_id = ?').get(id) as { total: number };
+        finalPaid = sumRow.total;
+      } else if (initialPaid > 0) {
+        // Backfill initial transaction
+        const txId = 'tx-' + id + '-' + Date.now();
+        db.prepare(`
+          INSERT INTO lift_payout_transactions (id, lift_id, chit_id, member_id, amount, payment_date, payment_method, reference_number, notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(txId, id, chitId, memberId, initialPaid, dateValue, methodValue, refValue, notesValue || 'Initial lift payout', now);
+      }
+
+      const remaining = Math.max(0, configuredPayout - finalPaid);
+      const payoutStatus = remaining <= 0 ? 'PAID' : 'PARTIAL';
+
       db.prepare(`
         UPDATE lift_details
-        SET lift_month = ?, lift_amount_received = ?, lift_date = ?, payment_method = ?, reference_number = ?, notes = ?, status = 'Completed', updated_at = ?
+        SET lift_month = ?, lift_amount = ?, lift_amount_received = ?, remaining_payout = ?, payout_status = ?, lift_date = ?, payment_method = ?, reference_number = ?, notes = ?, status = 'Completed', updated_at = ?
         WHERE id = ?
-      `).run(parsedMonth, finalAmount, dateValue, methodValue, refValue, notesValue, now, id);
+      `).run(parsedMonth, configuredPayout, finalPaid, remaining, payoutStatus, dateValue, methodValue, refValue, notesValue, now, id);
     } else {
+      const remaining = Math.max(0, configuredPayout - initialPaid);
+      const payoutStatus = remaining <= 0 ? 'PAID' : 'PARTIAL';
+
       db.prepare(`
-        INSERT INTO lift_details (id, chit_id, member_id, lift_month, lift_amount_received, lift_date, payment_method, reference_number, notes, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Completed', ?, ?)
-      `).run(id, chitId, memberId, parsedMonth, finalAmount, dateValue, methodValue, refValue, notesValue, now, now);
+        INSERT INTO lift_details (id, chit_id, member_id, lift_month, lift_amount, lift_amount_received, remaining_payout, payout_status, lift_date, payment_method, reference_number, notes, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Completed', ?, ?)
+      `).run(id, chitId, memberId, parsedMonth, configuredPayout, initialPaid, remaining, payoutStatus, dateValue, methodValue, refValue, notesValue, now, now);
+
+      if (initialPaid > 0) {
+        const txId = 'tx-' + id + '-' + Date.now();
+        db.prepare(`
+          INSERT INTO lift_payout_transactions (id, lift_id, chit_id, member_id, amount, payment_date, payment_method, reference_number, notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(txId, id, chitId, memberId, initialPaid, dateValue, methodValue, refValue, notesValue || 'Initial lift payout', now);
+      }
     }
 
     // Sync dues on lift (pre-lift vs post-lift payment transition)
@@ -1407,10 +1724,14 @@ function handleSaveLift(chitId: string, memberId: string, body: any, res: any) {
   try {
     tx();
     const updatedLift = db.prepare('SELECT * FROM lift_details WHERE id = ?').get(id) as any;
+    const transactions = db.prepare('SELECT * FROM lift_payout_transactions WHERE lift_id = ? ORDER BY payment_date ASC, created_at ASC').all(id);
     res.json({
       success: true,
       message: `Member marked as lifted in Month ${parsedMonth}.`,
-      lift: updatedLift
+      lift: {
+        ...updatedLift,
+        transactions
+      }
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1438,6 +1759,7 @@ app.delete('/api/chits/:id/lift/:memberId', (req, res) => {
   const rulesMap = new Map(rules.map(r => [r.month_number, r]));
 
   const tx = db.transaction(() => {
+    db.prepare('DELETE FROM lift_payout_transactions WHERE member_id = ?').run(memberId);
     db.prepare('DELETE FROM lift_details WHERE member_id = ?').run(memberId);
 
     // Reset unpaid dues to pre_lift_payment
@@ -1454,6 +1776,96 @@ app.delete('/api/chits/:id/lift/:memberId', (req, res) => {
 
   tx();
   res.json({ success: true, message: 'Lift cancelled and dues reverted to pre-lift amounts.' });
+});
+
+// Receive partial or remaining lift payout payment from manager to customer
+app.post('/api/chits/:id/lift/:memberId/payout', (req, res) => {
+  const chitId = req.params.id;
+  const memberId = req.params.memberId;
+  const { amount, payment_date, payment_method, reference_number, notes } = req.body;
+
+  const numericAmount = Number(amount);
+  if (isNaN(numericAmount) || numericAmount <= 0) {
+    return res.status(400).json({ error: 'Please enter a valid payout payment amount greater than zero.' });
+  }
+
+  const lift = db.prepare('SELECT * FROM lift_details WHERE chit_id = ? AND member_id = ?').get(chitId, memberId) as any;
+  if (!lift) {
+    return res.status(404).json({ error: 'Lift record not found for this customer.' });
+  }
+
+  // Maximum allowed amount: Remaining Lift Payout
+  const remaining = Number(lift.remaining_payout !== undefined && lift.remaining_payout !== null
+    ? lift.remaining_payout
+    : Math.max(0, lift.lift_amount - lift.lift_amount_received)
+  );
+
+  if (numericAmount > remaining) {
+    return res.status(400).json({
+      error: `Payment cannot exceed the remaining lift payout of ₹${new Intl.NumberFormat('en-IN').format(remaining)}.`
+    });
+  }
+
+  const now = new Date().toISOString();
+  const txId = 'tx-payout-' + lift.id + '-' + Date.now();
+  const dateValue = payment_date ? String(payment_date).trim() : new Date().toISOString().split('T')[0];
+  const methodValue = payment_method ? String(payment_method).trim() : 'Cash';
+  const refValue = reference_number ? String(reference_number).trim() : null;
+  const notesValue = notes ? String(notes).trim() : null;
+
+  const tx = db.transaction(() => {
+    // 1. Insert transaction into lift_payout_transactions
+    db.prepare(`
+      INSERT INTO lift_payout_transactions (id, lift_id, chit_id, member_id, amount, payment_date, payment_method, reference_number, notes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(txId, lift.id, chitId, memberId, numericAmount, dateValue, methodValue, refValue, notesValue, now);
+
+    // 2. Sum all transactions for this lift to compute total paid
+    const sumRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM lift_payout_transactions WHERE lift_id = ?').get(lift.id) as { total: number };
+    const totalPaid = sumRow.total;
+    const configuredPayout = Number(lift.lift_amount);
+    const newRemaining = Math.max(0, configuredPayout - totalPaid);
+    const newStatus = newRemaining <= 0 ? 'PAID' : 'PARTIAL';
+
+    // 3. Update lift_details record
+    db.prepare(`
+      UPDATE lift_details
+      SET lift_amount_received = ?, remaining_payout = ?, payout_status = ?, updated_at = ?
+      WHERE id = ?
+    `).run(totalPaid, newRemaining, newStatus, now, lift.id);
+  });
+
+  try {
+    tx();
+    const updatedLift = db.prepare('SELECT * FROM lift_details WHERE id = ?').get(lift.id) as any;
+    const transactions = db.prepare('SELECT * FROM lift_payout_transactions WHERE lift_id = ? ORDER BY payment_date ASC, created_at ASC').all(lift.id);
+    return res.json({
+      success: true,
+      message: `Lift payout payment of ₹${new Intl.NumberFormat('en-IN').format(numericAmount)} recorded successfully.`,
+      lift: updatedLift,
+      transactions
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all lift payout transactions for a member
+app.get('/api/chits/:id/lift/:memberId/transactions', (req, res) => {
+  const chitId = req.params.id;
+  const memberId = req.params.memberId;
+
+  const lift = db.prepare('SELECT * FROM lift_details WHERE chit_id = ? AND member_id = ?').get(chitId, memberId) as any;
+  if (!lift) {
+    return res.status(404).json({ error: 'Lift record not found for this customer.' });
+  }
+
+  const transactions = db.prepare('SELECT * FROM lift_payout_transactions WHERE lift_id = ? ORDER BY payment_date ASC, created_at ASC').all(lift.id);
+
+  return res.json({
+    lift,
+    transactions
+  });
 });
 
 // ----------------- PAYMENTS -----------------
@@ -1501,7 +1913,7 @@ app.post('/api/payments', (req, res) => {
   const currentPaymentsTotal = currentPaymentsTotalRow ? Number(currentPaymentsTotalRow.total) : 0;
   const currentBalance = Math.max(0, Number(due.due_amount) - currentPaymentsTotal);
 
-  if (amount > currentBalance && !allow_overpayment) {
+  if (amount > (currentBalance + 0.01) && !allow_overpayment) {
     return res.status(400).json({
       error: `Payment amount (₹${amount.toLocaleString('en-IN')}) exceeds outstanding balance (₹${currentBalance.toLocaleString('en-IN')}).`
     });
@@ -1516,8 +1928,8 @@ app.post('/api/payments', (req, res) => {
   const tx = db.transaction(() => {
     // 7. Insert payment record into payments table
     db.prepare(`
-      INSERT INTO payments (id, monthly_due_id, chit_id, member_id, month_number, month_name, amount, payment_method, reference_no, notes, payment_date, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO payments (id, monthly_due_id, chit_id, member_id, month_number, month_name, amount, payment_method, reference_no, notes, payment_date, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       paymentId,
       monthly_due_id,
@@ -1530,11 +1942,15 @@ app.post('/api/payments', (req, res) => {
       reference_no || '',
       notes || '',
       payDate,
+      now,
       now
     );
 
     // 8. Re-aggregate authoritative total paid from payments table
-    const postPaymentRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(monthly_due_id) as any;
+    const postPaymentRow = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM payments 
+      WHERE (monthly_due_id = ? OR (chit_id = ? AND member_id = ? AND month_number = ?))
+    `).get(monthly_due_id, due.chit_id, due.member_id, due.month_number) as any;
     const authoritativePaid = postPaymentRow ? Number(postPaymentRow.total) : amount;
     const newBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
     const newStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
@@ -1584,7 +2000,7 @@ app.get('/api/payments', (req, res) => {
     query += ' AND p.member_id = ?';
     params.push(member_id);
   }
-  query += ' ORDER BY p.payment_date DESC, p.created_at DESC LIMIT ?';
+  query += ' ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.payment_date DESC, p.created_at DESC LIMIT ?';
   params.push(Number(limit));
 
   const list = db.prepare(query).all(...params);
@@ -1594,14 +2010,27 @@ app.get('/api/payments', (req, res) => {
 // GET all payments for a specific monthly due
 app.get('/api/dues/:dueId/payments', (req, res) => {
   const { dueId } = req.params;
-  const payments = db.prepare(`
-    SELECT p.*, m.customer_name, m.phone, m.ticket_number, c.name as chit_name
-    FROM payments p
-    LEFT JOIN members m ON p.member_id = m.id
-    LEFT JOIN chits c ON p.chit_id = c.id
-    WHERE p.monthly_due_id = ?
-    ORDER BY p.payment_date DESC, p.created_at DESC
-  `).all(dueId);
+  const due = db.prepare('SELECT * FROM monthly_dues WHERE id = ?').get(dueId) as any;
+  let payments: any[] = [];
+  if (due) {
+    payments = db.prepare(`
+      SELECT p.*, m.customer_name, m.phone, m.ticket_number, c.name as chit_name
+      FROM payments p
+      LEFT JOIN members m ON p.member_id = m.id
+      LEFT JOIN chits c ON p.chit_id = c.id
+      WHERE p.monthly_due_id = ? OR (p.chit_id = ? AND p.member_id = ? AND p.month_number = ?)
+      ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.payment_date DESC, p.created_at DESC
+    `).all(dueId, due.chit_id, due.member_id, due.month_number);
+  } else {
+    payments = db.prepare(`
+      SELECT p.*, m.customer_name, m.phone, m.ticket_number, c.name as chit_name
+      FROM payments p
+      LEFT JOIN members m ON p.member_id = m.id
+      LEFT JOIN chits c ON p.chit_id = c.id
+      WHERE p.monthly_due_id = ?
+      ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.payment_date DESC, p.created_at DESC
+    `).all(dueId);
+  }
   res.json(payments);
 });
 
@@ -1629,7 +2058,7 @@ app.put('/api/payments/:id', (req, res) => {
   const diff = newAmount - oldAmount;
   const newPaidAmount = Math.max(0, Number(due.paid_amount) + diff);
 
-  if (newPaidAmount > due.due_amount && !req.body.allow_overpayment) {
+  if (newPaidAmount > (Number(due.due_amount) + 0.01) && !req.body.allow_overpayment) {
     const maxAllowed = Number(due.due_amount) - (Number(due.paid_amount) - oldAmount);
     return res.status(400).json({
       error: `New payment amount exceeds due balance. Maximum allowed amount is ${maxAllowed}.`
@@ -1643,16 +2072,20 @@ app.put('/api/payments/:id', (req, res) => {
   const newRef = reference_no !== undefined ? reference_no : payment.reference_no;
   const newNotes = notes !== undefined ? notes : payment.notes;
   const newDate = payment_date || payment.payment_date;
+  const now = new Date().toISOString();
 
   const tx = db.transaction(() => {
     db.prepare(`
       UPDATE payments
-      SET amount = ?, payment_method = ?, reference_no = ?, notes = ?, payment_date = ?
+      SET amount = ?, payment_method = ?, reference_no = ?, notes = ?, payment_date = ?, updated_at = ?
       WHERE id = ?
-    `).run(newAmount, newMethod, newRef, newNotes, newDate, id);
+    `).run(newAmount, newMethod, newRef, newNotes, newDate, now, id);
 
     // Re-aggregate authoritative sum from payments table
-    const postRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(due.id) as any;
+    const postRow = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM payments 
+      WHERE (monthly_due_id = ? OR (chit_id = ? AND member_id = ? AND month_number = ?))
+    `).get(due.id, due.chit_id, due.member_id, due.month_number) as any;
     const authoritativePaid = postRow ? Number(postRow.total) : newPaidAmount;
     const finalBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
     const finalStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
@@ -1693,7 +2126,10 @@ app.delete('/api/payments/:id', (req, res) => {
     db.prepare('DELETE FROM payments WHERE id = ?').run(id);
 
     // Re-aggregate authoritative sum from payments table
-    const postRow = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?').get(due.id) as any;
+    const postRow = db.prepare(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM payments 
+      WHERE (monthly_due_id = ? OR (chit_id = ? AND member_id = ? AND month_number = ?))
+    `).get(due.id, due.chit_id, due.member_id, due.month_number) as any;
     const authoritativePaid = postRow ? Number(postRow.total) : 0;
     const finalBalance = Math.max(0, Number(due.due_amount) - authoritativePaid);
     const finalStatus = authoritativePaid >= Number(due.due_amount) ? 'PAID' : (authoritativePaid > 0 ? 'PARTIAL' : 'PENDING');
@@ -1720,6 +2156,9 @@ app.get('/api/dues/pending', (req, res) => {
   try {
     const { chit_id, current_only } = req.query;
     const isCurrentOnly = current_only !== 'false';
+
+    // Synchronize dynamic current months
+    syncChitsCurrentMonth();
 
     // Ensure monthly dues are generated for active chits
     const activeChits = db.prepare("SELECT id, current_month FROM chits WHERE status = 'active'").all() as any[];
@@ -1803,7 +2242,7 @@ app.get('/api/chits/:id/reports', (req, res) => {
   // 2. Customer-wise report
   const customerWise = db.prepare(`
     SELECT m.id, m.customer_name, m.phone, m.ticket_number, m.status,
-           l.id as lift_id, l.lift_month, l.lift_amount_received, l.lift_amount_received as lift_amount, l.lift_date,
+           l.id as lift_id, l.lift_month, l.lift_amount, l.lift_amount_received, l.remaining_payout, l.payout_status, l.lift_date,
            l.payment_method, l.reference_number, l.notes as lift_notes, l.status as lift_status_text,
            CASE WHEN l.id IS NOT NULL THEN 'lifted' ELSE 'not_lifted' END as lift_status,
            COALESCE(SUM(d.due_amount), 0) as total_due,

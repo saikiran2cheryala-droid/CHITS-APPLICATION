@@ -353,12 +353,19 @@ export default function App() {
         <PaymentModal
           due={paymentDue}
           onClose={() => setPaymentDue(null)}
-          onSuccess={() => {
+          onSuccess={(savedPayment, dueRecord) => {
+            if (dueRecord?.chit_id && dueRecord?.month_number) {
+              try {
+                sessionStorage.setItem(`active_month_${dueRecord.chit_id}`, String(dueRecord.month_number));
+              } catch (e) {
+                // ignore
+              }
+            }
             triggerRefresh();
             setPaymentDue(null);
           }}
           onSubmit={async (payload) => {
-            await api.payments.record(payload);
+            return await api.payments.record(payload);
           }}
         />
       )}
@@ -388,6 +395,7 @@ export default function App() {
         memberId={customerProfileId}
         onClose={() => setCustomerProfileId(null)}
         onRecordPaymentClick={(due) => setPaymentDue(due)}
+        onPaymentUpdated={triggerRefresh}
         onOpenLift={async (chitId, memberId, isLifted, liftMonth) => {
           setCustomerProfileId(null);
           try {

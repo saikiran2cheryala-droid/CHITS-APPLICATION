@@ -6,7 +6,7 @@ import { formatINR } from '../utils/formatters';
 interface PaymentModalProps {
   due: MonthlyDue | null;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (savedPayment?: any, due?: MonthlyDue) => void;
   onSubmit: (payload: {
     monthly_due_id: string;
     amount: number;
@@ -70,15 +70,19 @@ export const PaymentModal: React.FC<PaymentModalProps> = ({ due, onClose, onSucc
     try {
       setIsSubmitting(true);
       setError(null);
-      await onSubmit({
+      const safePaymentDate = paymentDate
+        ? (paymentDate.includes('T') ? paymentDate : `${paymentDate}T12:00:00.000Z`)
+        : new Date().toISOString();
+
+      const result = await onSubmit({
         monthly_due_id: due.id,
         amount,
         payment_method: method,
         reference_no: referenceNo.trim() || undefined,
         notes: notes.trim() || undefined,
-        payment_date: paymentDate ? new Date(paymentDate).toISOString() : new Date().toISOString(),
+        payment_date: safePaymentDate,
       });
-      onSuccess();
+      onSuccess(result?.payment || result, due);
       onClose();
     } catch (err: any) {
       setError(err.message || 'Failed to record payment');

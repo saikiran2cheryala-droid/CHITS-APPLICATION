@@ -13,7 +13,7 @@ import {
   Phone,
   Edit2
 } from 'lucide-react';
-import { Member, MonthlyDue, Payment } from '../types';
+import { Member, MonthlyDue, Payment, LiftPayoutTransaction } from '../types';
 import { api } from '../services/api';
 import { formatINR, formatDate, formatDateTime, formatDDMMYYYY } from '../utils/formatters';
 import { EditPaymentModal } from './EditPaymentModal';
@@ -23,6 +23,7 @@ interface CustomerProfileModalProps {
   onClose: () => void;
   onRecordPaymentClick?: (due: MonthlyDue) => void;
   onOpenLift?: (chitId: string, memberId: string, isLifted: boolean, liftMonth?: number | null) => void;
+  onPaymentUpdated?: () => void;
 }
 
 interface ProfileData {
@@ -38,6 +39,7 @@ interface ProfileData {
   };
   dues: MonthlyDue[];
   payments: Payment[];
+  lift_transactions?: LiftPayoutTransaction[];
   total_paid: number;
   total_outstanding: number;
 }
@@ -47,6 +49,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
   onClose,
   onRecordPaymentClick,
   onOpenLift,
+  onPaymentUpdated,
 }) => {
   const [data, setData] = useState<ProfileData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -317,6 +320,15 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
 
                   <div>
                     <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
+                      Lift Status:
+                    </span>
+                    <span className="inline-flex items-center px-2 py-0.5 rounded-full font-bold text-xs bg-purple-100 text-purple-800 border border-purple-200 mt-1">
+                      LIFTED
+                    </span>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
                       Lift Month:
                     </span>
                     <span className="font-bold text-purple-900 text-sm block mt-0.5">
@@ -335,10 +347,49 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
 
                   <div>
                     <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
-                      Lift Amount:
+                      Configured Lift Payout:
                     </span>
-                    <span className="font-mono font-extrabold text-purple-700 text-base block mt-0.5">
-                      {formatINR(liftAmount)}
+                    <span className="font-mono font-extrabold text-slate-900 text-base block mt-0.5">
+                      {formatINR(data.member.lift_amount ?? data.member.chit_value)}
+                    </span>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
+                      Paid to Customer:
+                    </span>
+                    <span className="font-mono font-extrabold text-emerald-700 text-base block mt-0.5">
+                      {formatINR(data.member.lift_amount_received ?? 0)}
+                    </span>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
+                      Remaining Lift Payout:
+                    </span>
+                    <span className="font-mono font-extrabold text-amber-700 text-base block mt-0.5">
+                      {formatINR(
+                        data.member.remaining_payout !== undefined && data.member.remaining_payout !== null
+                          ? data.member.remaining_payout
+                          : Math.max(0, (data.member.lift_amount ?? data.member.chit_value) - (data.member.lift_amount_received ?? 0))
+                      )}
+                    </span>
+                  </div>
+
+                  <div>
+                    <span className="text-slate-500 font-semibold block uppercase tracking-wider text-[11px]">
+                      Payout Status:
+                    </span>
+                    <span
+                      className={`inline-block px-2.5 py-0.5 rounded-full font-black text-xs mt-1 ${
+                        (data.member.remaining_payout ?? 0) <= 0 && (data.member.lift_amount_received ?? 0) > 0
+                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                          : 'bg-amber-100 text-amber-800 border border-amber-200'
+                      }`}
+                    >
+                      {(data.member.remaining_payout ?? 0) <= 0 && (data.member.lift_amount_received ?? 0) > 0
+                        ? 'PAID'
+                        : 'PARTIAL'}
                     </span>
                   </div>
 
@@ -368,6 +419,38 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                       {liftNotes || '—'}
                     </p>
                   </div>
+
+                  {data.lift_transactions && data.lift_transactions.length > 0 && (
+                    <div className="sm:col-span-2 pt-2 border-t border-slate-200">
+                      <span className="text-slate-500 font-bold uppercase tracking-wider text-[11px] block mb-1.5">
+                        Lift Payout History:
+                      </span>
+                      <div className="overflow-x-auto rounded-lg border border-slate-200">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-slate-100 text-slate-600 font-semibold">
+                            <tr>
+                              <th className="p-2">Date</th>
+                              <th className="p-2 text-right">Amount</th>
+                              <th className="p-2">Method</th>
+                              <th className="p-2">Ref</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 bg-white">
+                            {data.lift_transactions.map((tx) => (
+                              <tr key={tx.id}>
+                                <td className="p-2 font-mono">{formatDDMMYYYY(tx.payment_date)}</td>
+                                <td className="p-2 text-right font-mono font-bold text-emerald-700">
+                                  {formatINR(tx.amount)}
+                                </td>
+                                <td className="p-2">{tx.payment_method}</td>
+                                <td className="p-2 font-mono text-slate-500">{tx.reference_number || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-center space-y-2">
@@ -624,6 +707,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           }}
           onSuccess={() => {
             fetchProfile();
+            onPaymentUpdated?.();
             setEditingPaymentDue(null);
             setEditingPaymentRecord(null);
           }}

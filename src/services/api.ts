@@ -1,4 +1,4 @@
-import { User, Chit, Member, ChitMonthRule, MonthlyDue, Payment, DashboardStats, MonthlyProfitDetails } from '../types';
+import { User, Chit, Member, ChitMonthRule, MonthlyDue, Payment, DashboardStats, MonthlyProfitDetails, LiftPayoutTransaction } from '../types';
 
 const TOKEN_KEY = 'chit_manager_auth_token';
 const USER_KEY = 'chit_manager_auth_user';
@@ -248,6 +248,26 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify({ payouts }),
       }),
+    getProjection: (id: string) =>
+      request<{
+        chit_id: string;
+        chit_name: string;
+        chit_value: number;
+        total_months: number;
+        total_members: number;
+        status: string;
+        total_projected_profit: number;
+        total_projected_collection: number;
+        total_projected_lift_payout: number;
+        monthly_projections: Array<{
+          month_number: number;
+          month_name: string;
+          projected_collection: number;
+          lift_payout: number;
+          profit_or_loss: number;
+          is_profit: boolean;
+        }>;
+      }>(`/api/chits/${id}/projection`),
   },
 
   members: {
@@ -306,6 +326,7 @@ export const api = {
         };
         lift: { id: string; lift_month: number; lift_amount_received: number; lift_date: string; notes?: string; customer_name: string; ticket_number: string } | null;
         profit?: MonthlyProfitDetails;
+        payments?: Payment[];
       }>(`/api/chits/${chitId}/months/${monthNumber}`),
     getProfit: (chitId: string, monthNumber: number) =>
       request<MonthlyProfitDetails>(`/api/chits/${chitId}/months/${monthNumber}/profit`),
@@ -317,6 +338,8 @@ export const api = {
       lift_month: number;
       lift_amount_received?: number;
       lift_amount?: number;
+      configured_lift_payout?: number;
+      initial_amount_paid?: number;
       lift_date: string;
       payment_method: string;
       reference_number?: string;
@@ -330,6 +353,8 @@ export const api = {
       lift_month: number;
       lift_amount_received?: number;
       lift_amount?: number;
+      configured_lift_payout?: number;
+      initial_amount_paid?: number;
       lift_date: string;
       payment_method: string;
       reference_number?: string;
@@ -343,6 +368,24 @@ export const api = {
       request<{ success: boolean; message: string }>(`/api/chits/${chitId}/lift/${memberId}`, {
         method: 'DELETE',
       }),
+    recordPayout: (chitId: string, memberId: string, payload: {
+      amount: number;
+      payment_date: string;
+      payment_method: string;
+      reference_number?: string;
+      notes?: string;
+    }) =>
+      request<{ success: boolean; message: string; lift: any; transactions: LiftPayoutTransaction[] }>(
+        `/api/chits/${chitId}/lift/${memberId}/payout`,
+        {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        }
+      ),
+    getTransactions: (chitId: string, memberId: string) =>
+      request<{ lift: any; transactions: LiftPayoutTransaction[] }>(
+        `/api/chits/${chitId}/lift/${memberId}/transactions`
+      ),
   },
 
   payments: {

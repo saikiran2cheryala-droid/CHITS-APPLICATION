@@ -224,7 +224,10 @@ export function initDatabase() {
       chit_id TEXT NOT NULL,
       member_id TEXT NOT NULL UNIQUE,
       lift_month INTEGER NOT NULL,
-      lift_amount_received REAL NOT NULL,
+      lift_amount REAL NOT NULL DEFAULT 0,
+      lift_amount_received REAL NOT NULL DEFAULT 0,
+      remaining_payout REAL DEFAULT 0,
+      payout_status TEXT DEFAULT 'PAID',
       lift_date TEXT NOT NULL,
       payment_method TEXT DEFAULT 'Cash',
       reference_number TEXT,
@@ -232,6 +235,22 @@ export function initDatabase() {
       status TEXT DEFAULT 'Completed',
       created_at TEXT NOT NULL,
       updated_at TEXT,
+      FOREIGN KEY (chit_id) REFERENCES chits(id) ON DELETE CASCADE,
+      FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS lift_payout_transactions (
+      id TEXT PRIMARY KEY,
+      lift_id TEXT NOT NULL,
+      chit_id TEXT NOT NULL,
+      member_id TEXT NOT NULL,
+      amount REAL NOT NULL,
+      payment_date TEXT NOT NULL,
+      payment_method TEXT NOT NULL DEFAULT 'Cash',
+      reference_number TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (lift_id) REFERENCES lift_details(id) ON DELETE CASCADE,
       FOREIGN KEY (chit_id) REFERENCES chits(id) ON DELETE CASCADE,
       FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
     );
@@ -266,6 +285,7 @@ export function initDatabase() {
       notes TEXT,
       payment_date TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      updated_at TEXT,
       FOREIGN KEY (monthly_due_id) REFERENCES monthly_dues(id) ON DELETE CASCADE,
       FOREIGN KEY (chit_id) REFERENCES chits(id) ON DELETE CASCADE,
       FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE
@@ -323,7 +343,32 @@ export function initDatabase() {
     if (!liftCols.includes('updated_at')) {
       db.exec("ALTER TABLE lift_details ADD COLUMN updated_at TEXT");
     }
+    if (!liftCols.includes('lift_amount')) {
+      db.exec("ALTER TABLE lift_details ADD COLUMN lift_amount REAL DEFAULT 0");
+      db.exec("UPDATE lift_details SET lift_amount = lift_amount_received WHERE lift_amount IS NULL OR lift_amount = 0");
+    }
+    if (!liftCols.includes('remaining_payout')) {
+      db.exec("ALTER TABLE lift_details ADD COLUMN remaining_payout REAL DEFAULT 0");
+      db.exec("UPDATE lift_details SET remaining_payout = MAX(0, lift_amount - lift_amount_received)");
+    }
+    if (!liftCols.includes('payout_status')) {
+      db.exec("ALTER TABLE lift_details ADD COLUMN payout_status TEXT DEFAULT 'PAID'");
+      db.exec("UPDATE lift_details SET payout_status = CASE WHEN remaining_payout <= 0 THEN 'PAID' ELSE 'PARTIAL' END");
+    }
     db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_lift_chit_month ON lift_details(chit_id, lift_month)");
+
+    // Safe migration: clean orphan lift_details rows and backfill lift_payout_transactions
+    try {
+      db.exec("DELETE FROM lift_details WHERE member_id NOT IN (SELECT id FROM members)");
+      db.exec(`
+        INSERT INTO lift_payout_transactions (id, lift_id, chit_id, member_id, amount, payment_date, payment_method, reference_number, notes, created_at)
+        SELECT 'tx-' || id || '-init', id, chit_id, member_id, lift_amount_received, lift_date, COALESCE(payment_method, 'Cash'), reference_number, COALESCE(notes, 'Initial lift payout'), created_at
+        FROM lift_details
+        WHERE id NOT IN (SELECT DISTINCT lift_id FROM lift_payout_transactions) AND lift_amount_received > 0;
+      `);
+    } catch (err) {
+      console.error('[DB MIGRATION] lift_payout_transactions backfill:', err);
+    }
 
     // Safe migration for chits (current_month and monthly_chit_value)
     const chitInfo = db.prepare("PRAGMA table_info(chits)").all() as any[];
@@ -362,6 +407,14 @@ export function initDatabase() {
     }
     if (!userCols.includes('recovery_locked_until')) {
       db.exec("ALTER TABLE users ADD COLUMN recovery_locked_until TEXT");
+    }
+
+    // Safe migration for payments table (updated_at)
+    const payInfo = db.prepare("PRAGMA table_info(payments)").all() as any[];
+    const payCols = payInfo.map(col => col.name);
+    if (!payCols.includes('updated_at')) {
+      db.exec("ALTER TABLE payments ADD COLUMN updated_at TEXT");
+      db.exec("UPDATE payments SET updated_at = created_at WHERE updated_at IS NULL");
     }
   } catch (err) {
     console.error('Migration note:', err);
@@ -543,6 +596,27 @@ export function computeChitCurrentMonth(startMonthStr: string, totalMonths: numb
 
   return calculatedMonth;
 }
+
+/**
+ * Synchronize the current_month column in chits table with the dynamic computed current month.
+ */
+export function syncChitsCurrentMonth() {
+  try {
+    const chits = db.prepare("SELECT id, start_month, total_months, current_month FROM chits").all() as any[];
+    const updateStmt = db.prepare("UPDATE chits SET current_month = ? WHERE id = ?");
+    for (const c of chits) {
+      const computed = computeChitCurrentMonth(c.start_month, c.total_months);
+      if (c.current_month !== computed) {
+        updateStmt.run(computed, c.id);
+      }
+    }
+  } catch (err) {
+    console.error('Failed to sync chits current_month', err);
+  }
+}
+
+// Ensure chits current_month is in sync immediately
+syncChitsCurrentMonth();
 
 // User Helpers
 export function findUserByLoginId(loginId: string) {
@@ -973,11 +1047,11 @@ export function ensureMonthlyDuesForChitAndMonth(chitId: string, monthNumber: nu
       } else {
         // Self-heal: ensure paid_amount on due matches actual sum of recorded payments
         const paymentSumRow = db.prepare(
-          'SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE monthly_due_id = ?'
-        ).get(existingDue.id) as any;
+          'SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE (monthly_due_id = ? OR (chit_id = ? AND member_id = ? AND month_number = ?))'
+        ).get(existingDue.id, chitId, member.id, monthNumber) as any;
         const totalPaidInPayments = paymentSumRow ? Number(paymentSumRow.total) : 0;
 
-        if (totalPaidInPayments > 0 && Number(existingDue.paid_amount) !== totalPaidInPayments) {
+        if (Number(existingDue.paid_amount) !== totalPaidInPayments) {
           const correctedBalance = Math.max(0, Number(existingDue.due_amount) - totalPaidInPayments);
           const correctedStatus = totalPaidInPayments >= Number(existingDue.due_amount) ? 'PAID' : (totalPaidInPayments > 0 ? 'PARTIAL' : 'PENDING');
           syncDueStmt.run(totalPaidInPayments, correctedBalance, correctedStatus, existingDue.id);
