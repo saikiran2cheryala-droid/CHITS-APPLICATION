@@ -1,0 +1,231 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                     String          @id
+  username               String          @unique
+  passwordHash           String          @map("password_hash")
+  salt                   String
+  name                   String
+  role                   String          @default("admin")
+  loginId                String?         @unique @map("login_id")
+  recoveryEmail          String?         @map("recovery_email")
+  recoveryPhone          String?         @map("recovery_phone")
+  isActive               Boolean         @default(true) @map("is_active")
+  failedLoginAttempts    Int             @default(0) @map("failed_login_attempts")
+  lockedUntil            DateTime?       @map("locked_until")
+  passwordChangedAt      DateTime?       @map("password_changed_at")
+  securityQuestion       String?         @map("security_question")
+  securityAnswerHash     String?         @map("security_answer_hash")
+  failedRecoveryAttempts Int             @default(0) @map("failed_recovery_attempts")
+  recoveryLockedUntil    DateTime?       @map("recovery_locked_until")
+  createdAt              DateTime        @default(now()) @map("created_at")
+  updatedAt              DateTime?       @updatedAt @map("updated_at")
+  lastLoginAt            DateTime?       @map("last_login_at")
+
+  sessions               Session[]
+  passwordResets         PasswordReset[]
+
+  @@map("users")
+}
+
+model Session {
+  id               String   @id
+  userId           String   @map("user_id")
+  sessionTokenHash String   @unique @map("session_token_hash")
+  expiresAt        DateTime @map("expires_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+  lastUsedAt       DateTime @default(now()) @map("last_used_at")
+  ipAddress        String?  @map("ip_address")
+  userAgent        String?  @map("user_agent")
+
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sessionTokenHash])
+  @@index([userId])
+  @@map("sessions")
+}
+
+model PasswordReset {
+  id           String   @id
+  userId       String   @map("user_id")
+  recoveryCode String   @map("recovery_code")
+  resetToken   String   @unique @map("reset_token")
+  expiresAt    DateTime @map("expires_at")
+  used         Boolean  @default(false)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([resetToken])
+  @@map("password_resets")
+}
+
+model Chit {
+  id               String      @id
+  name             String
+  chitValue        Decimal     @map("chit_value") @db.Decimal(12, 2)
+  monthlyChitValue Decimal     @default(301500) @map("monthly_chit_value") @db.Decimal(12, 2)
+  totalMonths      Int         @map("total_months")
+  totalMembers     Int         @map("total_members")
+  currentMonth     Int         @default(1) @map("current_month")
+  startMonth       String      @map("start_month")
+  endMonth         String      @map("end_month")
+  status           String      @default("active")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+
+  rules            ChitMonthRule[]
+  members          Member[]
+  liftDetails      LiftDetail[]
+  liftPayoutTransactions LiftPayoutTransaction[]
+  monthlyDues      MonthlyDue[]
+  payments         Payment[]
+
+  @@index([status])
+  @@map("chits")
+}
+
+model ChitMonthRule {
+  id                 String   @id
+  chitId             String   @map("chit_id")
+  monthNumber        Int      @map("month_number")
+  monthName          String   @map("month_name")
+  preLiftPayment     Decimal  @map("pre_lift_payment") @db.Decimal(12, 2)
+  postLiftPayment    Decimal  @map("post_lift_payment") @db.Decimal(12, 2)
+  monthlyChitValue   Decimal  @map("monthly_chit_value") @db.Decimal(12, 2)
+  expectedLiftPayout Decimal  @map("expected_lift_payout") @db.Decimal(12, 2)
+
+  chit               Chit     @relation(fields: [chitId], references: [id], onDelete: Cascade)
+
+  @@unique([chitId, monthNumber])
+  @@index([chitId])
+  @@map("chit_month_rules")
+}
+
+model Member {
+  id           String      @id
+  chitId       String      @map("chit_id")
+  customerName String      @map("customer_name")
+  phone        String
+  ticketNumber String?     @map("ticket_number")
+  status       String      @default("active")
+  joinDate     DateTime    @map("join_date")
+  createdAt    DateTime    @default(now()) @map("created_at")
+
+  chit         Chit        @relation(fields: [chitId], references: [id], onDelete: Cascade)
+  liftDetail   LiftDetail?
+  liftPayoutTransactions LiftPayoutTransaction[]
+  monthlyDues  MonthlyDue[]
+  payments     Payment[]
+
+  @@index([chitId])
+  @@index([phone])
+  @@index([customerName])
+  @@map("members")
+}
+
+model LiftDetail {
+  id                 String      @id
+  chitId             String      @map("chit_id")
+  memberId           String      @unique @map("member_id")
+  liftMonth          Int         @map("lift_month")
+  liftAmount         Decimal     @default(0) @map("lift_amount") @db.Decimal(12, 2)
+  liftAmountReceived Decimal     @default(0) @map("lift_amount_received") @db.Decimal(12, 2)
+  remainingPayout    Decimal     @default(0) @map("remaining_payout") @db.Decimal(12, 2)
+  payoutStatus       String      @default("PAID") @map("payout_status")
+  liftDate           DateTime    @map("lift_date")
+  paymentMethod      String      @default("Cash") @map("payment_method")
+  referenceNumber    String?     @map("reference_number")
+  notes              String?
+  status             String      @default("Completed")
+  createdAt          DateTime    @default(now()) @map("created_at")
+  updatedAt          DateTime?   @updatedAt @map("updated_at")
+
+  chit               Chit        @relation(fields: [chitId], references: [id], onDelete: Cascade)
+  member             Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  transactions       LiftPayoutTransaction[]
+
+  @@index([chitId])
+  @@index([liftMonth])
+  @@map("lift_details")
+}
+
+model LiftPayoutTransaction {
+  id              String      @id
+  liftId          String      @map("lift_id")
+  chitId          String      @map("chit_id")
+  memberId        String      @map("member_id")
+  amount          Decimal     @db.Decimal(12, 2)
+  paymentDate     DateTime    @map("payment_date")
+  paymentMethod   String      @default("Cash") @map("payment_method")
+  referenceNumber String?     @map("reference_number")
+  notes           String?
+  createdAt       DateTime    @default(now()) @map("created_at")
+
+  lift            LiftDetail  @relation(fields: [liftId], references: [id], onDelete: Cascade)
+  chit            Chit        @relation(fields: [chitId], references: [id], onDelete: Cascade)
+  member          Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([liftId])
+  @@index([chitId])
+  @@index([memberId])
+  @@map("lift_payout_transactions")
+}
+
+model MonthlyDue {
+  id            String    @id
+  chitId        String    @map("chit_id")
+  memberId      String    @map("member_id")
+  monthNumber   Int       @map("month_number")
+  monthName     String    @map("month_name")
+  dueAmount     Decimal   @map("due_amount") @db.Decimal(12, 2)
+  paidAmount    Decimal   @default(0) @map("paid_amount") @db.Decimal(12, 2)
+  balanceAmount Decimal   @map("balance_amount") @db.Decimal(12, 2)
+  status        String    @default("PENDING")
+  dueDate       DateTime  @map("due_date")
+  generatedAt   DateTime  @default(now()) @map("generated_at")
+
+  chit          Chit      @relation(fields: [chitId], references: [id], onDelete: Cascade)
+  member        Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  payments      Payment[]
+
+  @@unique([chitId, memberId, monthNumber])
+  @@index([chitId, monthNumber])
+  @@index([memberId])
+  @@index([status])
+  @@map("monthly_dues")
+}
+
+model Payment {
+  id            String      @id
+  monthlyDueId  String      @map("monthly_due_id")
+  chitId        String      @map("chit_id")
+  memberId      String      @map("member_id")
+  monthNumber   Int         @map("month_number")
+  monthName     String      @map("month_name")
+  amount        Decimal     @db.Decimal(12, 2)
+  paymentMethod String      @map("payment_method")
+  referenceNo   String?     @map("reference_no")
+  notes         String?
+  paymentDate   DateTime    @map("payment_date")
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime?   @updatedAt @map("updated_at")
+
+  monthlyDue    MonthlyDue  @relation(fields: [monthlyDueId], references: [id], onDelete: Cascade)
+  chit          Chit        @relation(fields: [chitId], references: [id], onDelete: Cascade)
+  member        Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([monthlyDueId])
+  @@index([chitId, monthNumber])
+  @@index([memberId])
+  @@index([paymentDate])
+  @@map("payments")
+}

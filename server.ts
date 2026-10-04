@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import path from 'path';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
@@ -42,6 +43,24 @@ syncChitsCurrentMonth();
 
 const app = express();
 app.set('trust proxy', 1);
+
+// Configure CORS for production and development
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
+  : ['http://localhost:3000', 'http://localhost:5173'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (process.env.NODE_ENV !== 'production' || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, true); // Permissive for production web clients
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 
 // Determine port: dev server must run on port 3000 (control-plane-api and nginx reverse proxy expects 3000)
 const args = process.argv.slice(2);
