@@ -14,6 +14,7 @@ export const db = new Database(DB_PATH);
 // Enable WAL mode & foreign keys
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('synchronous = NORMAL');
 
 export function hashPassword(plainText: string, salt?: string) {
   const actualSalt = salt || crypto.randomBytes(16).toString('hex');
