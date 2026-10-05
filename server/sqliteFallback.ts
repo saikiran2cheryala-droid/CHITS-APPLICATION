@@ -29,7 +29,7 @@ import {
   computeChitCurrentMonth as dbComputeChitCurrentMonth,
   syncChitsCurrentMonth as dbSyncChitsCurrentMonth,
   initDatabase as dbInitDatabase,
-} from './db';
+} from './db.ts';
 
 export {
   dbFindUserByLoginId,

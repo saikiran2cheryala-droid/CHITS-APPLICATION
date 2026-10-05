@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import crypto from 'crypto';
 import cookieParser from 'cookie-parser';
 import { createServer as createViteServer } from 'vite';
@@ -56,9 +57,10 @@ import {
   getPendingDues,
   getChitReports,
   globalSearch,
-} from './server/prismaRepository';
-import { hasPostgresConnection } from './server/prisma';
-import { sendPasswordRecoveryEmail } from './server/email';
+} from './server/prismaRepository.ts';
+import { hasPostgresConnection } from './server/prisma.ts';
+import { sendPasswordRecoveryEmail } from './server/email.ts';
+import { realtimeManager } from './server/realtime.ts';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -81,16 +83,16 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// Determine port: dev server must run on port 3000 (control-plane-api and nginx reverse proxy expects 3000)
+// Determine port: Cloud Run sets PORT (e.g. 8080); local dev server runs on port 3000
 const args = process.argv.slice(2);
 const portArgIndex = args.indexOf('--port');
 const portFromArgs = portArgIndex !== -1 && args[portArgIndex + 1] ? Number(args[portArgIndex + 1]) : null;
-const PORT = portFromArgs || (process.env.NODE_ENV === 'production' ? Number(process.env.PORT || 3000) : 3000);
+const PORT = Number(process.env.PORT) || portFromArgs || 3000;
 
 app.use(express.json());
 app.use(cookieParser(process.env.SESSION_SECRET));
 
-// Helper to extract session token from HTTP-only Cookie or Bearer header
+// Helper to extract session token strictly from HTTP-only Cookie or Bearer header
 function extractToken(req: express.Request): string | null {
   if (req.signedCookies && req.signedCookies.chit_session) {
     return req.signedCookies.chit_session;
@@ -593,6 +595,30 @@ app.get('/api/dashboard/stats', async (req, res) => {
   }
 });
 
+// ----------------- SERVER-SENT EVENTS (SSE) REAL-TIME STREAM -----------------
+app.get('/api/events', authMiddleware, (req, res) => {
+  // Set standard SSE response headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  if (typeof (res as any).flushHeaders === 'function') {
+    (res as any).flushHeaders();
+  }
+
+  const user = (req as any).user;
+  const ip = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress;
+  const ua = req.headers['user-agent'];
+
+  const clientId = realtimeManager.addClient(user.id, res, { ip, userAgent: ua });
+
+  req.on('close', () => {
+    realtimeManager.removeClient(clientId);
+  });
+});
+
 // ----------------- CHITS CRUD -----------------
 app.get('/api/chits', async (req, res) => {
   try {
@@ -620,6 +646,12 @@ app.post('/api/chits', async (req, res) => {
     }
 
     const created = await createChitFull(req.body);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: created.id,
+      entity: 'chit',
+      action: 'created',
+    });
     res.status(201).json(created);
   } catch (err: any) {
     console.error('Create chit error:', err);
@@ -663,6 +695,12 @@ app.put('/api/chits/:id', async (req, res) => {
   try {
     const updated = await updateChit(req.params.id, req.body);
     if (!updated) return res.status(404).json({ error: 'Chit not found' });
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'chit',
+      action: 'updated',
+    });
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -672,6 +710,12 @@ app.put('/api/chits/:id', async (req, res) => {
 app.delete('/api/chits/:id', async (req, res) => {
   try {
     await deleteChitFull(req.params.id);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'chit',
+      action: 'deleted',
+    });
     res.json({ success: true, message: 'Chit and all associated records deleted successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -686,6 +730,12 @@ app.put('/api/chits/:id/rules', async (req, res) => {
       return res.status(400).json({ error: 'Rules array is required' });
     }
     await updateChitRules(req.params.id, rules);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'rule',
+      action: 'updated',
+    });
     res.json({ success: true, message: 'Rules updated successfully. Historical paid dues were preserved.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -700,6 +750,12 @@ app.put('/api/chits/:id/rules/lift-payouts', async (req, res) => {
       return res.status(400).json({ error: 'Payouts array is required and must not be empty.' });
     }
     const result = await updateMonthRulePayouts(req.params.id, payouts);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'rule',
+      action: 'updated',
+    });
     res.json({
       success: true,
       message: `Successfully updated lift payouts for ${result.updated_count} month${result.updated_count === 1 ? '' : 's'}.`,
@@ -752,6 +808,12 @@ app.post('/api/chits/:id/members', async (req, res) => {
     }
     const created = await addMemberToChit(req.params.id, req.body);
     if (!created) return res.status(404).json({ error: 'Chit not found' });
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'member',
+      action: 'created',
+    });
     res.status(201).json(created);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -766,6 +828,12 @@ app.post('/api/chits/:id/members/import', async (req, res) => {
       return res.status(400).json({ error: 'Customers array is required and cannot be empty' });
     }
     const result = await importMembersToChit(req.params.id, customers);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'member',
+      action: 'created',
+    });
     res.json(result);
   } catch (err: any) {
     console.error('Import members error:', err);
@@ -776,6 +844,14 @@ app.post('/api/chits/:id/members/import', async (req, res) => {
 app.put('/api/members/:id', async (req, res) => {
   try {
     const updated = await updateMember(req.params.id, req.body);
+    if (updated && updated.chit_id) {
+      realtimeManager.broadcast({
+        type: 'data_changed',
+        chitId: updated.chit_id,
+        entity: 'member',
+        action: 'updated',
+      });
+    }
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -784,7 +860,18 @@ app.put('/api/members/:id', async (req, res) => {
 
 app.delete('/api/members/:id', async (req, res) => {
   try {
-    const result = await deleteMember(req.params.id);
+    const memberId = req.params.id;
+    const profile = await getMemberProfile(memberId);
+    const chitId = profile?.member?.chit_id || (profile?.member as any)?.chitId;
+    const result = await deleteMember(memberId);
+    if (chitId) {
+      realtimeManager.broadcast({
+        type: 'data_changed',
+        chitId,
+        entity: 'member',
+        action: 'deleted',
+      });
+    }
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -808,6 +895,12 @@ app.post('/api/chits/:id/lift', async (req, res) => {
     const chitId = req.params.id;
     const memberId = req.body.member_id || req.body.memberId;
     const lift = await saveLiftAuction(chitId, memberId, req.body);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId,
+      entity: 'lift',
+      action: 'created',
+    });
     res.json({
       success: true,
       message: `Member marked as lifted in Month ${req.body.lift_month}.`,
@@ -823,6 +916,12 @@ app.put('/api/chits/:id/lift/:memberId', async (req, res) => {
     const chitId = req.params.id;
     const memberId = req.params.memberId || req.body.member_id;
     const lift = await saveLiftAuction(chitId, memberId, req.body);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId,
+      entity: 'lift',
+      action: 'updated',
+    });
     res.json({
       success: true,
       message: `Member marked as lifted in Month ${req.body.lift_month}.`,
@@ -836,6 +935,12 @@ app.put('/api/chits/:id/lift/:memberId', async (req, res) => {
 app.delete('/api/chits/:id/lift/:memberId', async (req, res) => {
   try {
     await deleteLiftAuction(req.params.id, req.params.memberId);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'lift',
+      action: 'deleted',
+    });
     res.json({ success: true, message: 'Lift cancelled and dues reverted to pre-lift amounts.' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -846,6 +951,12 @@ app.delete('/api/chits/:id/lift/:memberId', async (req, res) => {
 app.post('/api/chits/:id/lift/:memberId/payout', async (req, res) => {
   try {
     const result = await recordLiftPayoutPayment(req.params.id, req.params.memberId, req.body);
+    realtimeManager.broadcast({
+      type: 'data_changed',
+      chitId: req.params.id,
+      entity: 'lift_payout',
+      action: 'created',
+    });
     return res.json({
       success: true,
       message: `Lift payout payment of ₹${new Intl.NumberFormat('en-IN').format(Number(req.body.amount))} recorded successfully.`,
@@ -872,6 +983,15 @@ app.get('/api/chits/:id/lift/:memberId/transactions', async (req, res) => {
 app.post('/api/payments', async (req, res) => {
   try {
     const result = await createPaymentRecord(req.body);
+    const chitId = result.payment?.chit_id || result.updatedDue?.chit_id;
+    if (chitId) {
+      realtimeManager.broadcast({
+        type: 'data_changed',
+        chitId,
+        entity: 'payment',
+        action: 'created',
+      });
+    }
     res.status(201).json({ ...result, success: true });
   } catch (err: any) {
     console.error('[PAYMENT ERROR]', err);
@@ -907,6 +1027,15 @@ app.get('/api/dues/:dueId/payments', async (req, res) => {
 app.put('/api/payments/:id', async (req, res) => {
   try {
     const result = await updatePaymentRecord(req.params.id, req.body);
+    const chitId = result.payment?.chit_id || result.updatedDue?.chit_id;
+    if (chitId) {
+      realtimeManager.broadcast({
+        type: 'data_changed',
+        chitId,
+        entity: 'payment',
+        action: 'updated',
+      });
+    }
     res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -917,6 +1046,15 @@ app.put('/api/payments/:id', async (req, res) => {
 app.delete('/api/payments/:id', async (req, res) => {
   try {
     const result = await deletePaymentRecord(req.params.id);
+    const chitId = result.updatedDue?.chit_id;
+    if (chitId) {
+      realtimeManager.broadcast({
+        type: 'data_changed',
+        chitId,
+        entity: 'payment',
+        action: 'deleted',
+      });
+    }
     res.json({ success: true, message: 'Payment record removed and due balance updated.', ...result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -994,19 +1132,22 @@ async function startServer() {
     console.log('[DATABASE] PostgreSQL initialized and synchronized successfully.');
   } else {
     console.warn('[DATABASE] DATABASE_URL not set! Falling back to offline development mode.');
-    const { initDatabase, syncChitsCurrentMonth: syncSqlite } = await import('./server/db');
+    const { initDatabase, syncChitsCurrentMonth: syncSqlite } = await import('./server/db.ts');
     initDatabase();
     syncSqlite();
   }
 
-  if (process.env.NODE_ENV !== 'production') {
+  const distPath = path.join(process.cwd(), 'dist');
+  const hasBuiltAssets = fs.existsSync(path.join(distPath, 'index.html'));
+  const isProduction = process.env.NODE_ENV === 'production' || hasBuiltAssets;
+
+  if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

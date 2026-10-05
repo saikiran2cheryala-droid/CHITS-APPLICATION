@@ -26,6 +26,7 @@ import { LoginPage } from './components/LoginPage';
 import { SecuritySettingsModal } from './components/SecuritySettingsModal';
 import { EditChitModal } from './components/EditChitModal';
 import { DeleteChitModal } from './components/DeleteChitModal';
+import { useRealtimeSync } from './hooks/useRealtimeSync';
 
 export default function App() {
   // Authentication State
@@ -69,6 +70,13 @@ export default function App() {
   const triggerRefresh = useCallback(() => {
     setRefreshKey((k) => k + 1);
   }, []);
+
+  // Real-Time Multi-Device Synchronization (SSE)
+  useRealtimeSync({
+    triggerRefresh,
+    activeChitId: selectedChitId,
+    isLoggedIn: Boolean(currentUser),
+  });
 
   // Check auth session on startup
   useEffect(() => {

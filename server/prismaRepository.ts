@@ -15,9 +15,9 @@
  */
 
 import { PrismaClient } from '@prisma/client';
-import { getPrisma, hasPostgresConnection } from './prisma';
+import { getPrisma, hasPostgresConnection } from './prisma.ts';
 import crypto from 'crypto';
-import * as sqlite from './sqliteFallback';
+import * as sqlite from './sqliteFallback.ts';
 
 export function getClient(): PrismaClient {
   const p = getPrisma();
