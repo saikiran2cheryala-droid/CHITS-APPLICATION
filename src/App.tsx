@@ -204,7 +204,7 @@ export default function App() {
                 </span>
                 <span className="hidden sm:inline-flex items-center gap-1 text-[10px] font-bold bg-slate-800 text-emerald-400 px-2 py-0.5 rounded-full border border-slate-700">
                   <Database className="w-2.5 h-2.5" />
-                  SQLite Persistent
+                  PostgreSQL Persistent
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 hidden sm:block">
