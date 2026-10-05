@@ -335,6 +335,60 @@ async function main() {
       });
     }
 
+    // 9. Sessions
+    const sessions = sqlite.prepare('SELECT * FROM sessions').all() as any[];
+    console.log(`Migrating ${sessions.length} sessions...`);
+    for (const s of sessions) {
+      await prisma.session.upsert({
+        where: { id: s.id },
+        update: {
+          userId: s.user_id,
+          sessionTokenHash: s.session_token_hash,
+          expiresAt: new Date(s.expires_at),
+          createdAt: new Date(s.created_at),
+          lastUsedAt: new Date(s.last_used_at),
+          ipAddress: s.ip_address,
+          userAgent: s.user_agent,
+        },
+        create: {
+          id: s.id,
+          userId: s.user_id,
+          sessionTokenHash: s.session_token_hash,
+          expiresAt: new Date(s.expires_at),
+          createdAt: new Date(s.created_at),
+          lastUsedAt: new Date(s.last_used_at),
+          ipAddress: s.ip_address,
+          userAgent: s.user_agent,
+        },
+      });
+    }
+
+    // 10. Password Resets
+    const resets = sqlite.prepare('SELECT * FROM password_resets').all() as any[];
+    console.log(`Migrating ${resets.length} password resets...`);
+    for (const r of resets) {
+      await prisma.passwordReset.upsert({
+        where: { id: r.id },
+        update: {
+          userId: r.user_id,
+          recoveryCode: r.recovery_code,
+          resetToken: r.reset_token,
+          expiresAt: new Date(r.expires_at),
+          used: Boolean(r.used),
+          createdAt: new Date(r.created_at),
+        },
+        create: {
+          id: r.id,
+          userId: r.user_id,
+          recoveryCode: r.recovery_code,
+          resetToken: r.reset_token,
+          expiresAt: new Date(r.expires_at),
+          used: Boolean(r.used),
+          createdAt: new Date(r.created_at),
+        },
+      });
+    }
+
     console.log('\n🎉 ALL DATA MIGRATED SUCCESSFULLY TO POSTGRESQL!');
   } finally {
     await prisma.$disconnect();
@@ -357,6 +411,8 @@ function exportToSql(sqlite: Database.Database) {
     'lift_payout_transactions',
     'monthly_dues',
     'payments',
+    'sessions',
+    'password_resets',
   ];
 
   for (const t of tables) {

@@ -153,6 +153,7 @@ model LiftDetail {
   member             Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
   transactions       LiftPayoutTransaction[]
 
+  @@unique([chitId, liftMonth])
   @@index([chitId])
   @@index([liftMonth])
   @@unique([chitId, liftMonth])

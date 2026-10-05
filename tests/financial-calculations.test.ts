@@ -12,7 +12,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { hashPassword, verifyPassword } from '../server/db';
+import { hashPassword, verifyPassword } from '../server/prismaRepository';
 
 describe('Chit Fund Financial Calculations', () => {
 

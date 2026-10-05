@@ -1,20 +1,48 @@
-import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import Database from 'better-sqlite3';
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function ensureDataDir(): string {
+  const DATA_DIR = path.join(process.cwd(), 'data');
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  return DATA_DIR;
 }
 
-const DB_PATH = path.join(DATA_DIR, 'chit_manager.db');
-export const db = new Database(DB_PATH);
+// Lazy dynamic loader for SQLite fallback during offline development only
+let _sqliteDb: any = null;
+function getSqliteDb() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SQLite is disabled in production. Set DATABASE_URL to use PostgreSQL.');
+  }
 
-// Enable WAL mode & foreign keys
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-db.pragma('synchronous = NORMAL');
+  if (!_sqliteDb) {
+    try {
+      const dataDir = ensureDataDir();
+      const DB_PATH = path.join(dataDir, 'chit_manager.db');
+      _sqliteDb = new Database(DB_PATH);
+      _sqliteDb.pragma('journal_mode = WAL');
+      _sqliteDb.pragma('foreign_keys = ON');
+      _sqliteDb.pragma('synchronous = NORMAL');
+    } catch (e: any) {
+      console.warn('[SQLITE] Could not initialize SQLite driver:', e.message);
+    }
+  }
+  return _sqliteDb;
+}
+
+export const db = new Proxy({} as any, {
+  get(_target, prop) {
+    const sdb = getSqliteDb();
+    if (!sdb) {
+      throw new Error(`Database driver not available. Set DATABASE_URL to connect to PostgreSQL.`);
+    }
+    const val = sdb[prop];
+    return typeof val === 'function' ? val.bind(sdb) : val;
+  }
+});
 
 export function hashPassword(plainText: string, salt?: string) {
   const actualSalt = salt || crypto.randomBytes(16).toString('hex');
@@ -135,6 +163,10 @@ export function sanitizeUser(user: any) {
 }
 
 export function initDatabase() {
+  if (process.env.NODE_ENV === 'production') {
+    console.log('[DATABASE] SQLite initialization skipped in production mode.');
+    return;
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -615,9 +647,6 @@ export function syncChitsCurrentMonth() {
     console.error('Failed to sync chits current_month', err);
   }
 }
-
-// Ensure chits current_month is in sync immediately
-syncChitsCurrentMonth();
 
 // User Helpers
 export function findUserByLoginId(loginId: string) {
