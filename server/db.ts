@@ -14,8 +14,8 @@ function ensureDataDir(): string {
 // Lazy dynamic loader for SQLite fallback during offline development only
 let _sqliteDb: any = null;
 function getSqliteDb() {
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error('SQLite is disabled in production. Set DATABASE_URL to use PostgreSQL.');
+  if (process.env.NODE_ENV === 'production' && process.env.DATABASE_URL) {
+    throw new Error('SQLite is disabled when DATABASE_URL is configured. Use PostgreSQL.');
   }
 
   if (!_sqliteDb) {
@@ -163,8 +163,8 @@ export function sanitizeUser(user: any) {
 }
 
 export function initDatabase() {
-  if (process.env.NODE_ENV === 'production') {
-    console.log('[DATABASE] SQLite initialization skipped in production mode.');
+  if (process.env.NODE_ENV === 'production' && process.env.DATABASE_URL) {
+    console.log('[DATABASE] SQLite initialization skipped in production mode with PostgreSQL.');
     return;
   }
   db.exec(`

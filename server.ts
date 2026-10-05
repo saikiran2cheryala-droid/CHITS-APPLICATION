@@ -83,11 +83,8 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// Determine port: Cloud Run sets PORT (e.g. 8080); local dev server runs on port 3000
-const args = process.argv.slice(2);
-const portArgIndex = args.indexOf('--port');
-const portFromArgs = portArgIndex !== -1 && args[portArgIndex + 1] ? Number(args[portArgIndex + 1]) : null;
-const PORT = Number(process.env.PORT) || portFromArgs || 3000;
+// Dev server must run on port 3000 in AI Studio
+const PORT = 3000;
 
 app.use(express.json());
 app.use(cookieParser(process.env.SESSION_SECRET));
@@ -1124,14 +1121,19 @@ async function startServer() {
       const { execSync } = await import('child_process');
       console.log('[DATABASE] Checking and applying any pending Prisma migrations...');
       execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+      await initPostgresDatabase();
+      await syncChitsCurrentMonth();
+      console.log('[DATABASE] PostgreSQL initialized and synchronized successfully.');
     } catch (migErr: any) {
-      console.warn('[DATABASE] Note on migration deploy:', migErr.message || migErr);
+      console.warn('[DATABASE] PostgreSQL initialization failed, switching to SQLite:', migErr.message || migErr);
+      const { disablePostgres } = await import('./server/prisma.ts');
+      disablePostgres();
+      const { initDatabase, syncChitsCurrentMonth: syncSqlite } = await import('./server/db.ts');
+      initDatabase();
+      syncSqlite();
     }
-    await initPostgresDatabase();
-    await syncChitsCurrentMonth();
-    console.log('[DATABASE] PostgreSQL initialized and synchronized successfully.');
   } else {
-    console.warn('[DATABASE] DATABASE_URL not set! Falling back to offline development mode.');
+    console.warn('[DATABASE] PostgreSQL not configured. Running in local SQLite database mode.');
     const { initDatabase, syncChitsCurrentMonth: syncSqlite } = await import('./server/db.ts');
     initDatabase();
     syncSqlite();
@@ -1139,7 +1141,7 @@ async function startServer() {
 
   const distPath = path.join(process.cwd(), 'dist');
   const hasBuiltAssets = fs.existsSync(path.join(distPath, 'index.html'));
-  const isProduction = process.env.NODE_ENV === 'production' || hasBuiltAssets;
+  const isProduction = process.env.NODE_ENV === 'production' && hasBuiltAssets;
 
   if (!isProduction) {
     const vite = await createViteServer({

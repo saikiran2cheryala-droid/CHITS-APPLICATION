@@ -119,7 +119,7 @@ describe('Performance Optimization & End-to-End Workflows', () => {
     assert.equal(liftRes.remaining_payout, 150000);
 
     // Record second payout transaction to complete payout
-    const payoutRes = await recordLiftPayoutPayment(createdChitId, member1Id, {
+    const payoutRes: any = await recordLiftPayoutPayment(createdChitId, member1Id, {
       amount: 150000,
       payment_method: 'Cash',
       reference_number: 'TXN-LIFT-002',

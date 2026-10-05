@@ -42,8 +42,8 @@ describe('Real-Time Multi-Device Synchronization (SSE)', () => {
 
     testChitId = chit.id;
     const m1Data = await getMonthViewData(testChitId, 1);
-    testMemberId = m1Data.dues[0].member_id;
-    testDueId = m1Data.dues[0].id;
+    testMemberId = m1Data!.dues[0].member_id;
+    testDueId = m1Data!.dues[0].id;
   });
 
   afterEach(() => {
