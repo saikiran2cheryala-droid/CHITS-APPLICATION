@@ -84,7 +84,7 @@ export function runFinancialAudit(dbPath?: string) {
 
   // 7. Users and Authentication State
   const users = db.prepare('SELECT count(*) as count FROM users WHERE is_active = 1').get() as any;
-  const admin = db.prepare('SELECT login_id, name, recovery_email FROM users WHERE login_id = ?').get('9640488507') as any;
+  const admin = db.prepare("SELECT login_id, name, recovery_email FROM users WHERE role = 'admin' LIMIT 1").get() as any;
   console.log(`[USERS] Active User Accounts: ${users.count}`);
   console.log(`        Admin Account: ${admin?.name} (${admin?.login_id}) | Recovery: ${admin?.recovery_email}`);
 

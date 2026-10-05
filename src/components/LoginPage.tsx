@@ -76,7 +76,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
   const [resetToken, setResetToken] = useState('');
   const [maskedEmail, setMaskedEmail] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [devCode, setDevCode] = useState<string | null>(null);
 
   // New Password State (used for both reset and expired password)
   const [newPassword, setNewPassword] = useState('');
@@ -245,7 +244,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
     if (e) e.preventDefault();
     const cleanId = recoveryLoginId.trim();
     if (!cleanId) {
-      setErrorMessage('Please enter your Login ID or registered email.');
+      setErrorMessage('Please enter your Login ID or Username.');
       return;
     }
 
@@ -256,17 +255,13 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
       const res = await api.auth.forgotPassword(cleanId);
       setMaskedEmail(res.maskedEmail || null);
       setPreviewUrl(res.previewUrl || null);
-      if (res.devCode) {
-        setDevCode(res.devCode);
-        setRecoveryCode(res.devCode);
-      }
       if (res.resetToken) {
         setResetToken(res.resetToken);
       }
       setView('verify-email-code');
-      setSuccessMessage(res.message || 'Verification instructions sent to your email.');
+      setSuccessMessage(res.message || 'A 6-digit verification code has been sent to your registered recovery email.');
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to dispatch email instructions.');
+      setErrorMessage(err.message || 'Failed to dispatch verification code.');
     } finally {
       setActionLoading(false);
     }
@@ -450,10 +445,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                   type="button"
                   id="forgot-password-link-btn"
                   onClick={() => {
-                    setView('forgot-question');
+                    setView('forgot-email');
                     setErrorMessage(null);
                     setSuccessMessage(null);
                     setRecoveryLoginId(loginId || '');
+                    setRecoveryCode('');
+                    setMaskedEmail(null);
                     setSecurityQuestion(null);
                     setSecurityAnswer('');
                   }}
@@ -701,30 +698,31 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                 <button
                   type="button"
                   onClick={() => {
-                    setView('forgot-question');
+                    setView('login');
                     setErrorMessage(null);
                   }}
                   className="p-1 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer"
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </button>
-                <h3 className="text-base font-bold text-slate-900">Email Recovery</h3>
+                <h3 className="text-base font-bold text-slate-900">Forgot Password</h3>
               </div>
               <p className="text-xs text-slate-500">
-                Enter your Login ID or registered email address. We will dispatch a 6-digit verification code.
+                Enter your Login ID / Username. A 6-digit verification code will be sent to your registered recovery email.
               </p>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                  Login ID or Email
+                  Login ID / Username
                 </label>
                 <div className="relative">
                   <input
                     type="text"
                     required
+                    autoFocus
                     value={recoveryLoginId}
                     onChange={(e) => setRecoveryLoginId(e.target.value)}
-                    placeholder="Enter Login ID or email"
+                    placeholder="Enter your Login ID or Username"
                     className="w-full pl-3.5 pr-10 py-3 bg-slate-50 border border-slate-300 rounded-xl text-sm font-semibold text-slate-900 focus:ring-2 focus:ring-blue-600 focus:bg-white"
                   />
                   <Mail className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2" />
@@ -735,19 +733,34 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                 <button
                   type="submit"
                   disabled={actionLoading || !recoveryLoginId.trim()}
-                  className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-bold shadow-md shadow-blue-600/20 transition-all cursor-pointer disabled:opacity-50"
+                  className="w-full py-3.5 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-bold shadow-md shadow-blue-600/20 transition-all cursor-pointer disabled:opacity-50 flex items-center justify-center gap-2"
                 >
-                  {actionLoading ? 'Dispatching...' : 'Send Recovery Code to Email'}
+                  {actionLoading ? 'Sending Verification Code...' : 'Send Verification Code'}
+                  <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
 
-              <div className="text-center pt-1">
+              <div className="flex flex-col gap-2 pt-1 text-center">
                 <button
                   type="button"
-                  onClick={() => setView('forgot-question')}
+                  onClick={() => {
+                    setView('login');
+                    setErrorMessage(null);
+                  }}
                   className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
                 >
-                  Back to Security Question
+                  Back to Sign In
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setView('forgot-question');
+                    setErrorMessage(null);
+                  }}
+                  className="text-[11px] text-blue-600 hover:text-blue-800 cursor-pointer"
+                >
+                  Prefer recovery via Security Question? Click here
                 </button>
               </div>
             </form>
@@ -764,16 +777,19 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                 >
                   <ArrowLeft className="w-4 h-4" />
                 </button>
-                <h3 className="text-base font-bold text-slate-900">Check Your Email</h3>
+                <h3 className="text-base font-bold text-slate-900">Check Your Recovery Email</h3>
               </div>
 
               <div className="p-3.5 bg-blue-50 border border-blue-200 rounded-xl text-xs text-blue-900 space-y-2">
                 <p className="text-[12px] text-blue-800">
-                  We have dispatched a 6-digit verification code to:
+                  A 6-digit verification code has been dispatched to:
                 </p>
                 <div className="font-mono font-bold text-blue-950 bg-white py-1.5 px-3 rounded-lg border border-blue-200 text-xs">
-                  {maskedEmail || 'registered email address'}
+                  {maskedEmail || 'registered recovery email'}
                 </div>
+                <p className="text-[11px] text-slate-500">
+                  The verification code is valid for 10 minutes.
+                </p>
 
                 {previewUrl && (
                   <div className="pt-1.5 border-t border-blue-200">
@@ -789,15 +805,6 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                     </a>
                   </div>
                 )}
-
-                {devCode && (
-                  <div className="pt-1.5 border-t border-blue-200 flex items-center justify-between">
-                    <span className="text-[11px] text-blue-800">Verification Code:</span>
-                    <span className="font-mono font-bold bg-white px-2 py-0.5 rounded border border-blue-300 text-blue-950 text-xs">
-                      {devCode}
-                    </span>
-                  </div>
-                )}
               </div>
 
               <div>
@@ -808,6 +815,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onLoginSuccess, initialExp
                   id="recovery-code-input"
                   type="text"
                   required
+                  autoFocus
                   maxLength={6}
                   value={recoveryCode}
                   onChange={(e) => setRecoveryCode(e.target.value.replace(/\D/g, ''))}

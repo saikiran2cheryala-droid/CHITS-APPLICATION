@@ -127,7 +127,6 @@ export const api = {
         emailMode?: string;
         emailMessage?: string;
         previewUrl?: string;
-        devCode?: string;
         resetToken?: string;
         loginId?: string;
       }>('/api/auth/forgot-password', {

@@ -308,63 +308,47 @@ export async function initPostgresDatabase() {
   }
 
   const prisma = getClient();
-  const targetLoginId = '9640488507';
-  const targetInitialPassword = 'Saikiran@507';
 
   try {
-    const existing = await prisma.user.findFirst({
-      where: {
-        OR: [
-          { loginId: targetLoginId },
-          { username: targetLoginId },
-        ],
-      },
-    });
+    const userCount = await prisma.user.count();
+    if (userCount > 0) {
+      console.log('[AUTH] PostgreSQL user accounts verified.');
+      return;
+    }
 
     const now = new Date();
-    if (!existing) {
-      const { hash, salt } = hashPassword(targetInitialPassword);
-      const defaultAnswerHash = hashSecurityAnswer('9640488507');
+    const targetLoginId = process.env.INITIAL_ADMIN_LOGIN_ID || 'admin';
+    const targetInitialPassword = process.env.INITIAL_ADMIN_PASSWORD || 'Admin@12345';
+    const targetAdminName = process.env.INITIAL_ADMIN_NAME || 'Administrator';
+    const targetRecoveryEmail = process.env.INITIAL_ADMIN_RECOVERY_EMAIL || null;
+    const targetRecoveryPhone = process.env.INITIAL_ADMIN_RECOVERY_PHONE || null;
+    const targetSecurityQuestion = process.env.INITIAL_ADMIN_SECURITY_QUESTION || 'What is your primary contact number?';
+    const targetSecurityAnswer = process.env.INITIAL_ADMIN_SECURITY_ANSWER || targetLoginId;
 
-      await prisma.user.create({
-        data: {
-          id: 'admin-9640488507',
-          loginId: targetLoginId,
-          username: targetLoginId,
-          passwordHash: hash,
-          salt: salt,
-          name: 'Administrator',
-          role: 'admin',
-          recoveryEmail: 'saikiran2cheryala@gmail.com',
-          recoveryPhone: '9640488507',
-          isActive: true,
-          failedLoginAttempts: 0,
-          passwordChangedAt: now,
-          securityQuestion: 'What is your primary contact number?',
-          securityAnswerHash: defaultAnswerHash,
-          createdAt: now,
-          updatedAt: now,
-        },
-      });
-      console.log(`[AUTH] Production Admin account initialized for Login ID: ${targetLoginId}`);
-    } else {
-      const isCurrentValid = verifyPassword(targetInitialPassword, existing.passwordHash, existing.salt);
-      if (!isCurrentValid) {
-        const { hash, salt } = hashPassword(targetInitialPassword);
-        await prisma.user.update({
-          where: { id: existing.id },
-          data: {
-            passwordHash: hash,
-            salt: salt,
-            passwordChangedAt: existing.passwordChangedAt || now,
-            isActive: true,
-            failedLoginAttempts: 0,
-            lockedUntil: null,
-            updatedAt: now,
-          },
-        });
-      }
-    }
+    const { hash, salt } = hashPassword(targetInitialPassword);
+    const defaultAnswerHash = hashSecurityAnswer(targetSecurityAnswer);
+
+    await prisma.user.create({
+      data: {
+        id: `admin-${Date.now()}`,
+        loginId: targetLoginId,
+        username: targetLoginId,
+        passwordHash: hash,
+        salt: salt,
+        name: targetAdminName,
+        role: 'admin',
+        recoveryEmail: targetRecoveryEmail,
+        recoveryPhone: targetRecoveryPhone,
+        isActive: true,
+        failedLoginAttempts: 0,
+        passwordChangedAt: now,
+        securityQuestion: targetSecurityQuestion,
+        securityAnswerHash: defaultAnswerHash,
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+    console.log('[AUTH] Initial administrator account provisioned from environment configuration.');
   } catch (err) {
     console.error('[AUTH DB INIT ERROR]', err);
     throw err;
@@ -561,21 +545,35 @@ export function verifyTempChangePasswordToken(token: string): { user_id: string 
   return { user_id: entry.userId };
 }
 
+export function hashRecoveryCode(code: string): string {
+  const secret = process.env.SESSION_SECRET || 'chit-manager-recovery-secret-salt';
+  return crypto.createHmac('sha256', secret).update(code.trim()).digest('hex');
+}
+
 export async function createPasswordReset(userId: string) {
   if (!hasPostgresConnection()) {
     return sqlite.dbCreatePasswordReset(userId);
   }
 
   const prisma = getClient();
-  const recoveryCode = Math.floor(100000 + Math.random() * 900000).toString();
+  // Exactly 6 digits generated cryptographically securely
+  const recoveryCode = crypto.randomInt(100000, 1000000).toString();
+  const hashedCode = hashRecoveryCode(recoveryCode);
   const resetToken = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+  // Valid for 10 minutes
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+  // Invalidate any existing unused reset tokens for this user (single-use policy)
+  await prisma.passwordReset.updateMany({
+    where: { userId, used: false },
+    data: { used: true },
+  });
 
   await prisma.passwordReset.create({
     data: {
       id: `reset-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`,
       userId,
-      recoveryCode,
+      recoveryCode: hashedCode, // Store only secure hash of OTP
       resetToken,
       expiresAt,
       used: false,
@@ -594,17 +592,35 @@ export async function verifyPasswordResetCode(loginId: string, code: string) {
   const user = await findUserByLoginId(loginId);
   if (!user) return null;
 
+  if (user.recovery_locked_until) {
+    const lockedUntil = new Date(user.recovery_locked_until).getTime();
+    if (lockedUntil > Date.now()) {
+      throw new Error('Account recovery is locked due to too many failed attempts. Please try again after 15 minutes.');
+    }
+  }
+
+  const cleanCode = code.trim();
+  const hashedCode = hashRecoveryCode(cleanCode);
+
   const reset = await prisma.passwordReset.findFirst({
     where: {
       userId: user.id,
-      recoveryCode: code,
+      OR: [
+        { recoveryCode: hashedCode },
+        { recoveryCode: cleanCode },
+      ],
       used: false,
       expiresAt: { gt: new Date() },
     },
     orderBy: { createdAt: 'desc' },
   });
 
-  if (!reset) return null;
+  if (!reset) {
+    await recordFailedRecovery(user.id);
+    return null;
+  }
+
+  await resetFailedRecovery(user.id);
   return { resetToken: reset.resetToken, userId: user.id };
 }
 
@@ -645,6 +661,20 @@ export async function resetUserPasswordWithToken(resetToken: string, newPassword
     throw new Error('Invalid or expired reset token.');
   }
 
+  const validation = validatePasswordStrength(newPassword);
+  if (!validation.isValid) {
+    throw new Error(validation.error || 'Password does not meet security requirements.');
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: reset.userId } });
+  if (!user) {
+    throw new Error('User account not found.');
+  }
+
+  if (verifyPassword(newPassword, user.passwordHash, user.salt)) {
+    throw new Error('New password cannot be the same as your current password.');
+  }
+
   const { hash, salt } = hashPassword(newPassword);
   const now = new Date();
 
@@ -657,6 +687,8 @@ export async function resetUserPasswordWithToken(resetToken: string, newPassword
         passwordChangedAt: now,
         failedLoginAttempts: 0,
         lockedUntil: null,
+        failedRecoveryAttempts: 0,
+        recoveryLockedUntil: null,
       },
     }),
     prisma.passwordReset.update({

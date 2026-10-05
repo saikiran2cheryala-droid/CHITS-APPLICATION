@@ -88,10 +88,13 @@ const portFromArgs = portArgIndex !== -1 && args[portArgIndex + 1] ? Number(args
 const PORT = portFromArgs || (process.env.NODE_ENV === 'production' ? Number(process.env.PORT || 3000) : 3000);
 
 app.use(express.json());
-app.use(cookieParser());
+app.use(cookieParser(process.env.SESSION_SECRET));
 
 // Helper to extract session token from HTTP-only Cookie or Bearer header
 function extractToken(req: express.Request): string | null {
+  if (req.signedCookies && req.signedCookies.chit_session) {
+    return req.signedCookies.chit_session;
+  }
   if (req.cookies && req.cookies.chit_session) {
     return req.cookies.chit_session;
   }
@@ -264,24 +267,24 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const loginId = (req.body.loginId || req.body.username || '').toString().trim();
     if (!loginId) {
-      return res.status(400).json({ error: 'Login ID is required.' });
+      return res.status(400).json({ error: 'Login ID or Username is required.' });
     }
 
     const user = await findUserByLoginId(loginId);
     if (!user) {
-      return res.status(404).json({ error: 'Account not found matching this Login ID.' });
+      return res.status(404).json({ error: 'Account not found matching this Login ID or Username.' });
     }
 
     if (user.recovery_locked_until) {
       const lockedUntilTime = new Date(user.recovery_locked_until).getTime();
       if (lockedUntilTime > Date.now()) {
-        return res.status(429).json({ error: 'Too many recovery attempts. Please try again after 15 minutes.' });
+        return res.status(429).json({ error: 'Too many recovery attempts. Account recovery is temporarily locked for 15 minutes.' });
       }
     }
 
     if (!user.recovery_email) {
       return res.status(400).json({
-        error: 'No recovery email configured for this account. Please use Security Question recovery.',
+        error: 'No registered recovery email configured for this account. Please contact your system administrator.',
       });
     }
 
@@ -296,7 +299,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
       loginId: user.login_id || user.username,
       recoveryCode,
       resetLink,
-      expiresInMinutes: 15,
+      expiresInMinutes: 10,
     });
 
     const [local, domain] = user.recovery_email.split('@');
@@ -304,10 +307,10 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Recovery code sent successfully to registered email.',
+      message: 'A 6-digit verification code has been sent to your registered recovery email.',
       maskedEmail,
       emailSent: emailRes.sent,
-      previewUrl: emailRes.previewUrl,
+      previewUrl: process.env.NODE_ENV !== 'production' ? emailRes.previewUrl : undefined,
     });
   } catch (error: any) {
     console.error('[AUTH FORGOT PASSWORD EMAIL ERROR]', error);
@@ -318,26 +321,33 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 // POST /api/auth/verify-recovery (Verify 6-digit recovery code)
 app.post('/api/auth/verify-recovery', async (req, res) => {
   try {
-    const loginId = (req.body.loginId || '').toString().trim();
+    const loginId = (req.body.loginId || req.body.username || '').toString().trim();
     const code = (req.body.code || req.body.recoveryCode || '').toString().trim();
 
     if (!loginId || !code) {
-      return res.status(400).json({ error: 'Login ID and 6-digit recovery code are required.' });
+      return res.status(400).json({ error: 'Login ID and 6-digit verification code are required.' });
+    }
+
+    if (!/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: 'Verification code must be exactly 6 digits.' });
     }
 
     const result = await verifyPasswordResetCode(loginId, code);
     if (!result) {
-      return res.status(400).json({ error: 'Invalid or expired recovery code. Please request a new code.' });
+      return res.status(400).json({ error: 'Invalid or expired verification code. Please request a new code.' });
     }
 
     return res.json({
       success: true,
       resetToken: result.resetToken,
-      message: 'Recovery code verified successfully.',
+      message: 'Verification code verified successfully.',
     });
   } catch (error: any) {
     console.error('[AUTH VERIFY RECOVERY ERROR]', error);
-    return res.status(500).json({ error: 'Failed to verify recovery code.' });
+    if (error.message && error.message.includes('locked')) {
+      return res.status(429).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Failed to verify verification code.' });
   }
 });
 

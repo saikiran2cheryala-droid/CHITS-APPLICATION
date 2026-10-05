@@ -563,7 +563,7 @@ export const SecuritySettingsModal: React.FC<SecuritySettingsModalProps> = ({
                   type="text"
                   value={recoveryPhone}
                   onChange={(e) => setRecoveryPhone(e.target.value)}
-                  placeholder="e.g. 9640488507"
+                  placeholder="e.g. 9876543210"
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-sm font-medium text-slate-900 focus:ring-2 focus:ring-blue-600 focus:bg-white"
                 />
               </div>
@@ -576,7 +576,7 @@ export const SecuritySettingsModal: React.FC<SecuritySettingsModalProps> = ({
                   type="email"
                   value={recoveryEmail}
                   onChange={(e) => setRecoveryEmail(e.target.value)}
-                  placeholder="e.g. saikiran2cheryala@gmail.com"
+                  placeholder="e.g. recovery@example.com"
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-sm font-medium text-slate-900 focus:ring-2 focus:ring-blue-600 focus:bg-white"
                 />
               </div>

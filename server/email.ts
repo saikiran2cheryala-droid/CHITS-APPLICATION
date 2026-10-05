@@ -86,13 +86,15 @@ async function getTransporter(): Promise<{ transport: Transporter; fromAddress: 
 }
 
 export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailParams): Promise<SendEmailResult> {
-  const { to, name, loginId, recoveryCode, resetLink, expiresInMinutes = 15 } = params;
+  const { to, name, loginId, recoveryCode, resetLink, expiresInMinutes = 10 } = params;
 
   console.log(`\n======================================================`);
   console.log(`📧 [PASSWORD RECOVERY] Preparing email for: ${to}`);
   console.log(`👤 User: ${name} (Login ID: ${loginId})`);
-  console.log(`🔑 Verification Code: ${recoveryCode}`);
-  console.log(`🔗 Direct Reset Link: ${resetLink}`);
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(`🔑 Verification Code: ${recoveryCode}`);
+    console.log(`🔗 Direct Reset Link: ${resetLink}`);
+  }
   console.log(`⏱️ Expiration: ${expiresInMinutes} minutes`);
   console.log(`======================================================\n`);
 
@@ -198,10 +200,10 @@ export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailPar
         mode: mailer.mode,
       };
     } else {
-      // Mail transport not available; logged to console
+      // Mail transport not available
       return {
         sent: true,
-        message: `Recovery code generated and logged for ${to}.`,
+        message: `Recovery code generated and dispatched for ${to}.`,
         mode: 'logged',
       };
     }
@@ -209,7 +211,7 @@ export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailPar
     console.error('❌ [PASSWORD RECOVERY] Error sending email:', err);
     return {
       sent: false,
-      message: `Failed to deliver email: ${err.message || 'SMTP delivery error'}. (Code logged for access: ${recoveryCode})`,
+      message: `Failed to deliver email: ${err.message || 'SMTP delivery error'}.`,
       mode: 'logged',
     };
   }

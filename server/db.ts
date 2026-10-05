@@ -453,93 +453,46 @@ export function initDatabase() {
     console.error('Migration note:', err);
   }
 
-  // Ensure Initial Admin Account: Login ID 9640488507 with hashed password Saikiran@507
-  const targetLoginId = '9640488507';
-  const targetInitialPassword = 'Saikiran@507';
-  const existingAdmin = db.prepare("SELECT * FROM users WHERE login_id = ? OR username = ?").get(targetLoginId, targetLoginId) as any;
-  const now = new Date().toISOString();
-
-  if (!existingAdmin) {
-    const { hash, salt } = hashPassword(targetInitialPassword);
-    const defaultAnswerHash = hashSecurityAnswer('9640488507');
-    db.prepare(`
-      INSERT INTO users (
-        id, login_id, username, password_hash, salt, name, role,
-        recovery_email, recovery_phone, is_active, failed_login_attempts,
-        password_changed_at, security_question, security_answer_hash,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
-    `).run(
-      'admin-9640488507',
-      targetLoginId,
-      targetLoginId,
-      hash,
-      salt,
-      'Administrator',
-      'admin',
-      'saikiran2cheryala@gmail.com',
-      '9640488507',
-      now,
-      'What is your primary contact number?',
-      defaultAnswerHash,
-      now,
-      now
-    );
-    console.log(`[AUTH] Production Admin account initialized for Login ID: ${targetLoginId}`);
-  } else {
-    // If existingAdmin password is not yet verified with Saikiran@507, update to the required production password
-    const isCurrentValid = verifyPassword(targetInitialPassword, existingAdmin.password_hash, existingAdmin.salt);
-    if (!isCurrentValid) {
-      const { hash, salt } = hashPassword(targetInitialPassword);
-      db.prepare(`
-        UPDATE users SET 
-          password_hash = ?, 
-          salt = ?, 
-          password_changed_at = COALESCE(password_changed_at, ?),
-          is_active = 1, 
-          failed_login_attempts = 0, 
-          locked_until = NULL, 
-          updated_at = ?
-        WHERE id = ?
-      `).run(hash, salt, now, now, existingAdmin.id);
-      console.log(`[AUTH] Production Admin password hash synced for Login ID: ${targetLoginId}`);
-    } else {
-      // Ensure user is unlocked and active
-      db.prepare(`
-        UPDATE users SET 
-          is_active = 1, 
-          failed_login_attempts = 0, 
-          locked_until = NULL,
-          password_changed_at = COALESCE(password_changed_at, ?)
-        WHERE id = ?
-      `).run(now, existingAdmin.id);
-    }
-
-    // Ensure security question & answer hash exist
-    if (!existingAdmin.security_question || !existingAdmin.security_answer_hash) {
-      const defaultAnswerHash = hashSecurityAnswer('9640488507');
-      db.prepare(`
-        UPDATE users SET 
-          security_question = COALESCE(security_question, 'What is your primary contact number?'),
-          security_answer_hash = COALESCE(security_answer_hash, ?)
-        WHERE id = ?
-      `).run(defaultAnswerHash, existingAdmin.id);
-    }
-
-    // Ensure recovery email and phone are set for administrator accounts
-    try {
-      if (!existingAdmin.recovery_email) {
-        db.prepare("UPDATE users SET recovery_email = ?, recovery_phone = ? WHERE id = ?")
-          .run('saikiran2cheryala@gmail.com', '9640488507', existingAdmin.id);
-      }
-    } catch (_) {}
+  const userCount = (db.prepare("SELECT count(*) as count FROM users").get() as any)?.count || 0;
+  if (userCount > 0) {
+    return;
   }
 
-  // Clean up any legacy or duplicate admin accounts to maintain strict production credential single-identity
-  try {
-    db.prepare("DELETE FROM users WHERE id = 'admin-1' OR (login_id != ? AND username != ? AND role = 'admin')").run(targetLoginId, targetLoginId);
-    db.prepare("DELETE FROM sessions WHERE user_id = 'admin-1'").run();
-  } catch (_) {}
+  const targetLoginId = process.env.INITIAL_ADMIN_LOGIN_ID || 'admin';
+  const targetInitialPassword = process.env.INITIAL_ADMIN_PASSWORD || 'Admin@12345';
+  const targetAdminName = process.env.INITIAL_ADMIN_NAME || 'Administrator';
+  const targetRecoveryEmail = process.env.INITIAL_ADMIN_RECOVERY_EMAIL || '';
+  const targetRecoveryPhone = process.env.INITIAL_ADMIN_RECOVERY_PHONE || '';
+  const targetSecurityQuestion = process.env.INITIAL_ADMIN_SECURITY_QUESTION || 'What is your primary contact number?';
+  const targetSecurityAnswer = process.env.INITIAL_ADMIN_SECURITY_ANSWER || targetLoginId;
+  const now = new Date().toISOString();
+
+  const { hash, salt } = hashPassword(targetInitialPassword);
+  const defaultAnswerHash = hashSecurityAnswer(targetSecurityAnswer);
+  db.prepare(`
+    INSERT INTO users (
+      id, login_id, username, password_hash, salt, name, role,
+      recovery_email, recovery_phone, is_active, failed_login_attempts,
+      password_changed_at, security_question, security_answer_hash,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?)
+  `).run(
+    `admin-${Date.now()}`,
+    targetLoginId,
+    targetLoginId,
+    hash,
+    salt,
+    targetAdminName,
+    'admin',
+    targetRecoveryEmail,
+    targetRecoveryPhone,
+    now,
+    targetSecurityQuestion,
+    defaultAnswerHash,
+    now,
+    now
+  );
+  console.log('[AUTH] Local initial admin account created from environment configuration.');
 }
 
 const MONTH_NAMES = [
@@ -650,7 +603,9 @@ export function syncChitsCurrentMonth() {
 
 // User Helpers
 export function findUserByLoginId(loginId: string) {
+  if (!loginId || typeof loginId !== 'string') return null;
   const trimmed = loginId.trim();
+  if (!trimmed) return null;
   return db.prepare(`
     SELECT * FROM users 
     WHERE (login_id = ? OR username = ? OR LOWER(recovery_email) = LOWER(?)) 
@@ -813,19 +768,28 @@ export function destroyAllUserSessions(userId: string) {
   db.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
 }
 
+export function hashRecoveryCode(code: string): string {
+  const secret = process.env.SESSION_SECRET || 'chit-manager-recovery-secret-salt';
+  return crypto.createHmac('sha256', secret).update(code.trim()).digest('hex');
+}
+
 // Password Recovery Helpers
 export function createPasswordReset(userId: string) {
-  const recoveryCode = Math.floor(100000 + Math.random() * 900000).toString(); // 6 digits
+  const recoveryCode = crypto.randomInt(100000, 1000000).toString(); // Cryptographically secure 6 digits
+  const hashedCode = hashRecoveryCode(recoveryCode);
   const resetToken = crypto.randomBytes(32).toString('hex');
   const id = 'reset-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex');
   const now = new Date().toISOString();
-  // Expires in 15 minutes
-  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+  // Expires in 10 minutes
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+  // Invalidate any existing unused reset tokens for this user (single-use policy)
+  db.prepare("UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0").run(userId);
 
   db.prepare(`
     INSERT INTO password_resets (id, user_id, recovery_code, reset_token, expires_at, used, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?)
-  `).run(id, userId, recoveryCode, resetToken, expiresAt, now);
+  `).run(id, userId, hashedCode, resetToken, expiresAt, now);
 
   return { recoveryCode, resetToken, expiresAt };
 }
@@ -874,11 +838,14 @@ export function verifyPasswordResetCode(loginId: string, code: string) {
   const user = findUserByLoginId(loginId);
   if (!user) return null;
   const now = new Date().toISOString();
+  const cleanCode = code.trim();
+  const hashedCode = hashRecoveryCode(cleanCode);
+
   const resetRow = db.prepare(`
     SELECT * FROM password_resets
-    WHERE user_id = ? AND recovery_code = ? AND used = 0 AND expires_at > ?
+    WHERE user_id = ? AND (recovery_code = ? OR recovery_code = ?) AND used = 0 AND expires_at > ?
     ORDER BY created_at DESC LIMIT 1
-  `).get(user.id, code.trim(), now) as any;
+  `).get(user.id, hashedCode, cleanCode, now) as any;
 
   if (!resetRow) return null;
   return { user, resetToken: resetRow.reset_token };

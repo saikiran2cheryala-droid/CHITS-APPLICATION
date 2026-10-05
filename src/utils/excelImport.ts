@@ -351,8 +351,8 @@ export function downloadSampleExcelTemplate() {
     ['Ramesh Kumar', '9876543210'],
     ['Suresh Reddy', '9876543211'],
     ['Mahesh Varma', '9876543212'],
-    ['Cheryala Saikiran', '9640488507'],
-    ['Kiran Cheryala', '9876543213'],
+    ['Rajesh Sharma', '9876543213'],
+    ['Anil Verma', '9876543214'],
   ];
 
   const ws = XLSX.utils.aoa_to_sheet(sampleData);
