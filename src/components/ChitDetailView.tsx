@@ -83,7 +83,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   }, [actionFeedback]);
 
   // Month selector state for Monthly Sheet - preserves active month across navigation
-  const [selectedMonth, setSelectedMonth] = useState<number>(() => {
+  const [selectedMonth, setSelectedMonth] = useState<number | null>(() => {
     try {
       const saved = sessionStorage.getItem(`active_month_${chitId}`);
       if (saved && !isNaN(Number(saved)) && Number(saved) >= 1) {
@@ -92,10 +92,12 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
     } catch (e) {
       // ignore
     }
-    return 1;
+    return null;
   });
   const hasInitializedMonth = React.useRef(false);
   const activeFetchReqId = React.useRef(0);
+  const prevChitIdRef = React.useRef(chitId);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const changeSelectedMonth = (newMonth: number) => {
     setSelectedMonth(newMonth);
@@ -107,8 +109,27 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   };
 
   useEffect(() => {
-    hasInitializedMonth.current = false;
+    if (prevChitIdRef.current !== chitId) {
+      prevChitIdRef.current = chitId;
+      setChit(null);
+      setMonthData(null);
+      setLoading(true);
+      hasInitializedMonth.current = false;
+      try {
+        const saved = sessionStorage.getItem(`active_month_${chitId}`);
+        if (saved && !isNaN(Number(saved)) && Number(saved) >= 1) {
+          setSelectedMonth(Number(saved));
+        } else {
+          setSelectedMonth(null);
+        }
+      } catch (e) {
+        setSelectedMonth(null);
+      }
+    }
   }, [chitId]);
+
+  // Derived active month number (safe fallback when selectedMonth is resolving)
+  const activeMonth = selectedMonth ?? (chit?.current_month || 1);
 
   // Edit and Delete Chit modals state
   const [isEditChitOpen, setIsEditChitOpen] = useState(false);
@@ -122,7 +143,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   // Handlers for Lift Status Badges
   const handleNotLiftedClick = (memberId: string) => {
     if (!chit) return;
-    onOpenLiftModal(chit, chit.current_month || selectedMonth, memberId);
+    onOpenLiftModal(chit, chit.current_month || activeMonth, memberId);
   };
 
   const handleLiftedClick = (memberId: string, memberLiftMonth?: number | null) => {
@@ -238,7 +259,11 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
 
   // Load Chit
   useEffect(() => {
-    setLoading(true);
+    if (!chit) {
+      setLoading(true);
+    } else {
+      setIsRefreshing(true);
+    }
     api.chits
       .get(chitId)
       .then((data) => {
@@ -252,22 +277,33 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
             }))
           );
         }
-        if (data.current_month && !hasInitializedMonth.current) {
-          setSelectedMonth(data.current_month);
+        if (!hasInitializedMonth.current) {
+          let initMonth = selectedMonth;
+          if (initMonth === null || initMonth < 1) {
+            initMonth = data.current_month || 1;
+            try {
+              sessionStorage.setItem(`active_month_${chitId}`, String(initMonth));
+            } catch (e) {}
+          }
+          setSelectedMonth(initMonth);
           hasInitializedMonth.current = true;
         }
         setError(null);
       })
       .catch((err) => setError(err.message || 'Failed to load chit'))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        setLoading(false);
+        setIsRefreshing(false);
+      });
   }, [chitId, refreshKey]);
 
   // Load Month Data
-  const fetchMonthData = (m = selectedMonth) => {
+  const fetchMonthData = (m?: number) => {
     if (!chitId) return;
+    const targetMonth = m ?? selectedMonth ?? 1;
     setMonthLoading(true);
     api.monthView
-      .getData(chitId, m)
+      .getData(chitId, targetMonth)
       .then((data) => {
         setMonthData(data);
       })
@@ -295,6 +331,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   }, [activeTab, chitId, refreshKey]);
 
   useEffect(() => {
+    if (!chitId || selectedMonth === null) return;
     // Reset profit visibility to hidden whenever selected month changes
     setShowProfit(false);
     fetchMonthData(selectedMonth);
@@ -312,7 +349,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
     }
   }, [activeTab, chitId, refreshKey]);
 
-  if (loading) {
+  if (loading && !chit) {
     return (
       <div className="p-12 text-center text-slate-500">
         <div className="inline-block w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-3"></div>
@@ -350,14 +387,14 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
   });
 
   const handleNextMonth = () => {
-    if (selectedMonth < chit.total_months) {
-      setSelectedMonth((m) => m + 1);
+    if (activeMonth < chit.total_months) {
+      changeSelectedMonth(activeMonth + 1);
     }
   };
 
   const handlePrevMonth = () => {
-    if (selectedMonth > 1) {
-      setSelectedMonth((m) => m - 1);
+    if (activeMonth > 1) {
+      changeSelectedMonth(activeMonth - 1);
     }
   };
 
@@ -515,8 +552,8 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
             </label>
             <select
               id="top-current-month-select"
-              value={selectedMonth}
-              onChange={(e) => setSelectedMonth(parseInt(e.target.value, 10))}
+              value={activeMonth}
+              onChange={(e) => changeSelectedMonth(parseInt(e.target.value, 10))}
               className="bg-white border border-slate-300 text-slate-900 font-bold text-sm px-2.5 py-1 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
             >
               {chit.rules && chit.rules.length > 0
@@ -531,11 +568,17 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                     </option>
                   ))}
             </select>
+            {(isRefreshing || (monthLoading && monthData)) && (
+              <div
+                className="w-3.5 h-3.5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin ml-1"
+                title="Updating in background..."
+              />
+            )}
           </div>
 
           <button
             id="quick-lift-btn"
-            onClick={() => onOpenLiftModal(chit, selectedMonth)}
+            onClick={() => onOpenLiftModal(chit, activeMonth)}
             className="flex items-center gap-1.5 px-3.5 py-2 bg-purple-700 hover:bg-purple-800 text-white rounded-xl text-xs font-bold shadow-xs transition-colors cursor-pointer"
           >
             <Award className="w-4 h-4" />
@@ -588,7 +631,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 </span>
               </div>
               <span className="text-[11px] text-slate-400 mt-1 block">
-                Month {selectedMonth} Collection
+                Month {activeMonth} Collection
               </span>
             </div>
 
@@ -603,7 +646,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 </span>
               </div>
               <span className="text-[11px] text-slate-400 mt-1 block">
-                Month {selectedMonth} Outstanding
+                Month {activeMonth} Outstanding
               </span>
             </div>
 
@@ -727,7 +770,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
               <button
                 id="prev-month-btn"
                 onClick={handlePrevMonth}
-                disabled={selectedMonth <= 1}
+                disabled={activeMonth <= 1}
                 className="p-2 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none transition-colors"
                 title="Previous Month"
               >
@@ -737,8 +780,8 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
               <div className="flex items-center gap-2">
                 <select
                   id="month-dropdown-select"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(parseInt(e.target.value, 10))}
+                  value={activeMonth}
+                  onChange={(e) => changeSelectedMonth(parseInt(e.target.value, 10))}
                   className="px-3.5 py-2 text-sm sm:text-base font-extrabold text-slate-900 bg-slate-50 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 cursor-pointer"
                 >
                   {chit.rules?.map((r) => (
@@ -751,7 +794,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 <button
                   id="next-month-btn"
                   onClick={handleNextMonth}
-                  disabled={selectedMonth >= chit.total_months}
+                  disabled={activeMonth >= chit.total_months}
                   className="p-2 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 disabled:opacity-30 disabled:pointer-events-none transition-colors"
                   title="Next Month"
                 >
@@ -779,7 +822,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                     const preAmount = Number(monthData.rule.pre_lift_payment) || 0;
                     const postAmount = Number(monthData.rule.post_lift_payment) || 0;
                     const totalMembers = chit?.total_members || chit?.members?.length || 25;
-                    const monthNum = selectedMonth || chit?.current_month || 1;
+                    const monthNum = activeMonth;
                     const postLiftCount = Math.max(0, Math.min(monthNum - 1, totalMembers));
                     const preLiftCount = Math.max(0, totalMembers - postLiftCount);
                     const expectedCollection = monthData.profit?.projected_collection !== undefined
@@ -885,7 +928,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 </div>
               </div>
               <span className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-white border border-purple-200 text-purple-800 self-start sm:self-auto">
-                Customer pays Post-Lift amount from Month {selectedMonth + 1}
+                Customer pays Post-Lift amount from Month {activeMonth + 1}
               </span>
             </div>
           )}
@@ -969,7 +1012,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {monthLoading ? (
+                {monthLoading && !monthData ? (
                   <tr>
                     <td colSpan={10} className="py-12 text-center text-slate-500">
                       Loading monthly dues...
@@ -978,13 +1021,13 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                 ) : filteredDues.length === 0 ? (
                   <tr>
                     <td colSpan={10} className="py-12 text-center text-slate-500">
-                      No customer records match your search/filter for Month {selectedMonth}.
+                      No customer records match your search/filter for Month {activeMonth}.
                     </td>
                   </tr>
                 ) : (
                   filteredDues.map((due) => {
                     const isLifted = due.lift_status === 'lifted';
-                    const isLiftMonth = due.lift_month === selectedMonth;
+                    const isLiftMonth = due.lift_month === activeMonth;
 
                     return (
                       <tr key={due.id} className="hover:bg-slate-50/80 transition-colors">
@@ -1133,7 +1176,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                             {!isLifted && (
                               <button
                                 type="button"
-                                onClick={() => onOpenLiftModal(chit, selectedMonth, due.member_id)}
+                                onClick={() => onOpenLiftModal(chit, activeMonth, due.member_id)}
                                 title="Lift Chit for this member"
                                 className="p-1.5 text-purple-700 hover:bg-purple-100 rounded-lg transition-colors cursor-pointer"
                               >
@@ -1152,7 +1195,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
 
           {/* Mobile Cards View (Section 24: Mobile UI) */}
           <div className="block md:hidden space-y-3">
-            {monthLoading ? (
+            {monthLoading && !monthData ? (
               <div className="p-8 text-center text-slate-500">Loading dues...</div>
             ) : filteredDues.length === 0 ? (
               <div className="p-8 text-center text-slate-500 bg-white rounded-2xl border border-slate-200">
@@ -1772,7 +1815,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                   CURRENT MONTH
                 </span>
                 <span className="text-xl font-extrabold text-slate-900 block mt-1">
-                  Month {selectedMonth || chit.current_month || 1} / {chit.total_months || 20}
+                  Month {activeMonth} / {chit.total_months || 20}
                 </span>
               </div>
               <div className="sm:px-6 pt-4 sm:pt-0">
@@ -2152,7 +2195,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                   CURRENT MONTH
                 </span>
                 <span className="text-xl font-extrabold text-slate-900 block mt-1">
-                  Month {chit.current_month || selectedMonth || 1} / {chit.total_months || 25}
+                  Month {activeMonth} / {chit.total_months || 25}
                 </span>
               </div>
               <div className="sm:px-6 pt-4 sm:pt-0">
@@ -2418,7 +2461,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
                                 )}
                                 <button
                                   type="button"
-                                  onClick={() => onOpenLiftModal(chit, m.lift_month || selectedMonth, m.id)}
+                                  onClick={() => onOpenLiftModal(chit, m.lift_month || activeMonth, m.id)}
                                   className="px-2 py-1 text-[11px] font-bold text-blue-600 hover:bg-blue-50 rounded-lg transition-colors cursor-pointer"
                                 >
                                   Edit
@@ -2674,7 +2717,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
           setIsLiftDetailsOpen(false);
           setLiftDetailsMember(null);
           if (chit) {
-            onOpenLiftModal(chit, member.lift_month || selectedMonth, member.id);
+            onOpenLiftModal(chit, member.lift_month || activeMonth, member.id);
           }
         }}
       />
@@ -2684,7 +2727,7 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
         isOpen={showProfitDetailsModal}
         onClose={() => setShowProfitDetailsModal(false)}
         profitDetails={monthData?.profit}
-        monthNumber={selectedMonth}
+        monthNumber={activeMonth}
         monthName={monthData?.rule?.month_name}
         expectedLiftPayout={monthData?.rule?.expected_lift_payout}
         rule={monthData?.rule}
@@ -2721,7 +2764,6 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
         }}
         onImportToBackend={async (customers) => {
           const res = await api.members.importBatch(chit.id, customers);
-          triggerRefresh();
           return res;
         }}
       />
@@ -2739,7 +2781,6 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
         }}
         onImportToBackend={async (payouts) => {
           const res = await api.chits.updateLiftPayouts(chit.id, payouts);
-          triggerRefresh();
           return res;
         }}
       />
@@ -2754,8 +2795,6 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
             setEditingPaymentRecord(null);
           }}
           onSuccess={() => {
-            fetchMonthData(selectedMonth);
-            fetchChitPayments();
             triggerRefresh();
             setEditingPaymentDue(null);
             setEditingPaymentRecord(null);
@@ -2775,8 +2814,6 @@ export const ChitDetailView: React.FC<ChitDetailViewProps> = ({
           onSuccess={(savedPayment, dueRecord) => {
             const targetMonth = dueRecord?.month_number || localPaymentDue.month_number;
             changeSelectedMonth(targetMonth);
-            fetchMonthData(targetMonth);
-            fetchChitPayments();
             triggerRefresh();
             setLocalPaymentDue(null);
             setPaymentNotice({

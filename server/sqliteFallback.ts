@@ -127,7 +127,6 @@ export function fallbackGetDashboardStats() {
 
   const chitsSummary = chits.map(chit => {
     const currMonth = dbComputeChitCurrentMonth(chit.start_month, chit.total_months);
-    dbEnsureMonthlyDuesForChitAndMonth(chit.id, currMonth);
 
     const chitMembersCount = db.prepare("SELECT COUNT(*) as count FROM members WHERE chit_id = ? AND status = 'active'").get(chit.id) as { count: number };
     const chitToday = db.prepare('SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE chit_id = ? AND payment_date LIKE ?').get(chit.id, `${todayStr}%`) as { total: number };
@@ -254,7 +253,6 @@ export function fallbackGetAllChitsWithStats() {
   const chits = db.prepare('SELECT * FROM chits ORDER BY created_at DESC').all() as any[];
   return chits.map(chit => {
     const currMonth = dbComputeChitCurrentMonth(chit.start_month, chit.total_months);
-    dbEnsureMonthlyDuesForChitAndMonth(chit.id, currMonth);
 
     const memberCount = db.prepare('SELECT COUNT(*) as count FROM members WHERE chit_id = ?').get(chit.id) as { count: number };
     const monthStats = db.prepare(`
@@ -297,7 +295,6 @@ export function fallbackGetChitByIdWithDetails(chitId: string, queryMonth?: numb
 
   const computedCurrentMonth = dbComputeChitCurrentMonth(chit.start_month, chit.total_months);
   const selectedMonth = queryMonth || computedCurrentMonth;
-  dbEnsureMonthlyDuesForChitAndMonth(chit.id, selectedMonth);
 
   const monthStats = db.prepare(`
     SELECT 
@@ -510,8 +507,6 @@ export function fallbackUpdateMonthRulePayouts(chitId: string, payouts: any[]) {
 }
 
 export function fallbackGetMonthViewData(chitId: string, monthNumber: number) {
-  dbEnsureMonthlyDuesForChitAndMonth(chitId, monthNumber);
-
   const rule = db.prepare('SELECT * FROM chit_month_rules WHERE chit_id = ? AND month_number = ?').get(chitId, monthNumber) as any;
   if (!rule) return null;
 

@@ -112,9 +112,11 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Fetch Dashboard stats & chits
+  // Fetch Dashboard stats & chits (only when Dashboard view is active)
   useEffect(() => {
     if (!currentUser) return;
+    if (selectedChitId !== null) return;
+
     setDataLoading(true);
     Promise.all([api.dashboard.getStats(), api.chits.list()])
       .then(([statsRes, chitsRes]) => {
@@ -127,7 +129,7 @@ export default function App() {
       .finally(() => {
         setDataLoading(false);
       });
-  }, [currentUser, refreshKey]);
+  }, [currentUser, refreshKey, selectedChitId]);
 
   // Handler for opening Lift modal
   const handleOpenLiftModal = async (chit: Chit, defaultMonth: number, memberId?: string) => {

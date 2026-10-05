@@ -1073,27 +1073,49 @@ export async function getDashboardStats() {
   const projectedProfitBreakdown: any[] = [];
   const currentMonthProfitBreakdown: any[] = [];
 
+  const todayByChit = await prisma.payment.groupBy({
+    by: ['chitId'],
+    where: { paymentDate: { gte: todayStart, lte: todayEnd } },
+    _sum: { amount: true },
+  });
+  const todayByChitMap = new Map<string, number>();
+  for (const item of todayByChit) {
+    if (item.chitId) {
+      todayByChitMap.set(item.chitId, toNumber(item._sum.amount, 0));
+    }
+  }
+
+  const chitCurrentMonthMap = new Map<string, number>();
+  const orConditions = chits.map(c => {
+    const curr = computeChitCurrentMonth(c.startMonth, c.totalMonths);
+    chitCurrentMonthMap.set(c.id, curr);
+    return { chitId: c.id, monthNumber: curr };
+  });
+
+  const allDues = orConditions.length > 0
+    ? await prisma.monthlyDue.findMany({
+        where: { OR: orConditions },
+      })
+    : [];
+
+  const duesByChit = new Map<string, typeof allDues>();
+  for (const d of allDues) {
+    let list = duesByChit.get(d.chitId);
+    if (!list) {
+      list = [];
+      duesByChit.set(d.chitId, list);
+    }
+    list.push(d);
+  }
+
   const chitsSummary: any[] = [];
 
   for (const c of chits) {
     const serializedChit = serializeChit(c)!;
-    const currMonth = computeChitCurrentMonth(c.startMonth, c.totalMonths);
-    await ensureMonthlyDuesForChitAndMonth(c.id, currMonth);
-
+    const currMonth = chitCurrentMonthMap.get(c.id) || 1;
     const chitMembersCount = c.members.length;
-
-    const chitTodayAgg = await prisma.payment.aggregate({
-      where: {
-        chitId: c.id,
-        paymentDate: { gte: todayStart, lte: todayEnd },
-      },
-      _sum: { amount: true },
-    });
-    const chitToday = toNumber(chitTodayAgg._sum.amount, 0);
-
-    const dues = await prisma.monthlyDue.findMany({
-      where: { chitId: c.id, monthNumber: currMonth },
-    });
+    const chitToday = todayByChitMap.get(c.id) || 0;
+    const dues = duesByChit.get(c.id) || [];
 
     let monthTotalDue = 0;
     let monthTotalCollected = 0;
@@ -1248,14 +1270,33 @@ export async function getAllChitsWithStats() {
     },
   });
 
+  const chitCurrentMonthMap = new Map<string, number>();
+  const orConditions = chits.map(c => {
+    const curr = computeChitCurrentMonth(c.startMonth, c.totalMonths);
+    chitCurrentMonthMap.set(c.id, curr);
+    return { chitId: c.id, monthNumber: curr };
+  });
+
+  const allDues = orConditions.length > 0
+    ? await prisma.monthlyDue.findMany({
+        where: { OR: orConditions },
+      })
+    : [];
+
+  const duesByChit = new Map<string, typeof allDues>();
+  for (const d of allDues) {
+    let list = duesByChit.get(d.chitId);
+    if (!list) {
+      list = [];
+      duesByChit.set(d.chitId, list);
+    }
+    list.push(d);
+  }
+
   const result: any[] = [];
   for (const c of chits) {
-    const currMonth = computeChitCurrentMonth(c.startMonth, c.totalMonths);
-    await ensureMonthlyDuesForChitAndMonth(c.id, currMonth);
-
-    const dues = await prisma.monthlyDue.findMany({
-      where: { chitId: c.id, monthNumber: currMonth },
-    });
+    const currMonth = chitCurrentMonthMap.get(c.id) || 1;
+    const dues = duesByChit.get(c.id) || [];
 
     let totalDue = 0;
     let totalCollected = 0;
@@ -1308,7 +1349,6 @@ export async function getChitByIdWithDetails(chitId: string, queryMonth?: number
 
   const computedCurrentMonth = computeChitCurrentMonth(chit.startMonth, chit.totalMonths);
   const selectedMonth = queryMonth || computedCurrentMonth;
-  await ensureMonthlyDuesForChitAndMonth(chit.id, selectedMonth);
 
   const dues = await prisma.monthlyDue.findMany({
     where: { chitId, monthNumber: selectedMonth },
@@ -1628,7 +1668,6 @@ export async function getMonthViewData(chitId: string, monthNumber: number) {
   }
 
   const prisma = getClient();
-  await ensureMonthlyDuesForChitAndMonth(chitId, monthNumber);
 
   const chit = await prisma.chit.findUnique({
     where: { id: chitId },
