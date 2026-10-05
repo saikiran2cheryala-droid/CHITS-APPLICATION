@@ -57,6 +57,125 @@ export function toDateOnly(date: any): string {
   return String(date).split('T')[0];
 }
 
+/**
+ * Safe date-only parser that strictly handles:
+ * - DD-MM-YYYY (e.g. "22-08-2026", "01-08-2024")
+ * - DD/MM/YYYY (e.g. "22/08/2026", "01/08/2024")
+ * - YYYY-MM-DD (e.g. "2024-08-01", "2026-08-22")
+ * - ISO-8601 strings (e.g. "2026-08-22T00:00:00.000Z")
+ * - Valid Date objects
+ * 
+ * Never returns "Invalid Date". Returns null for invalid or empty inputs.
+ * Avoids any timezone-related date shifting by using UTC midnight representation.
+ */
+export function parseDateOnly(input: string | Date | null | undefined): Date | null {
+  if (input === null || input === undefined) return null;
+
+  if (input instanceof Date || Object.prototype.toString.call(input) === '[object Date]') {
+    const d = input as Date;
+    if (isNaN(d.getTime())) return null;
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+  }
+
+  const str = String(input).trim();
+  if (!str || str.toLowerCase() === 'invalid date' || str === 'null' || str === 'undefined' || str === '-') {
+    return null;
+  }
+
+  let year: number | null = null;
+  let month: number | null = null; // 1-12
+  let day: number | null = null;
+
+  // 1. DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY (e.g. "22-08-2026", "01-08-2024", "1-8-2024", "22.08.2026", "22/08/2026")
+  const dmyMatch = /^(\d{1,2})[-./](\d{1,2})[-./](\d{4})$/.exec(str);
+  if (dmyMatch) {
+    day = parseInt(dmyMatch[1], 10);
+    month = parseInt(dmyMatch[2], 10);
+    year = parseInt(dmyMatch[3], 10);
+  } else {
+    // 2. YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss (e.g. "2024-08-01", "2026-08-22T00:00:00.000Z", "2025/01/15")
+    const isoMatch = /^(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[T\s].*)?$/.exec(str);
+    if (isoMatch) {
+      year = parseInt(isoMatch[1], 10);
+      month = parseInt(isoMatch[2], 10);
+      day = parseInt(isoMatch[3], 10);
+    } else {
+      // Fallback: try Date constructor only if valid
+      const fallback = new Date(str);
+      if (isNaN(fallback.getTime())) return null;
+      year = fallback.getUTCFullYear();
+      month = fallback.getUTCMonth() + 1;
+      day = fallback.getUTCDate();
+    }
+  }
+
+  if (year === null || month === null || day === null) return null;
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return null;
+  if (year < 1900 || year > 2100) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+
+  // Validate exact days in month (handles leap years correctly)
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return null;
+
+  return new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+}
+
+const MONTH_NAMES_LIST = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december'
+];
+
+export function parseYearMonthHelper(str: string): { year: number; month: number } | null {
+  if (!str) return null;
+  const s = str.trim().toLowerCase();
+
+  const isoMatch = s.match(/^(\d{4})[-\/](\d{1,2})$/);
+  if (isoMatch) {
+    return { year: parseInt(isoMatch[1], 10), month: parseInt(isoMatch[2], 10) };
+  }
+
+  const slashMatch = s.match(/^(\d{1,2})[-\/](\d{4})$/);
+  if (slashMatch) {
+    return { year: parseInt(slashMatch[2], 10), month: parseInt(slashMatch[1], 10) };
+  }
+
+  const nameMatch = s.match(/([a-z]+)[\s,]+(\d{4})/i);
+  if (nameMatch) {
+    const monthName = nameMatch[1].toLowerCase();
+    const year = parseInt(nameMatch[2], 10);
+    const mIdx = MONTH_NAMES_LIST.findIndex(m => m.startsWith(monthName.substring(0, 3)));
+    if (mIdx !== -1) {
+      return { year, month: mIdx + 1 };
+    }
+  }
+
+  const reverseMatch = s.match(/(\d{4})[\s,]+([a-z]+)/i);
+  if (reverseMatch) {
+    const year = parseInt(reverseMatch[1], 10);
+    const monthName = reverseMatch[2].toLowerCase();
+    const mIdx = MONTH_NAMES_LIST.findIndex(m => m.startsWith(monthName.substring(0, 3)));
+    if (mIdx !== -1) {
+      return { year, month: mIdx + 1 };
+    }
+  }
+
+  return null;
+}
+
+export function getDefaultLiftDateObj(startMonthStr: string | null | undefined, liftMonthNumber: number = 1): Date {
+  const ym = parseYearMonthHelper(startMonthStr || '');
+  if (!ym) {
+    const now = new Date();
+    return new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0));
+  }
+  const targetIndex = (ym.month - 1) + (Math.max(1, liftMonthNumber) - 1);
+  const mIndex = ((targetIndex % 12) + 12) % 12;
+  const targetYear = ym.year + Math.floor(targetIndex / 12);
+  return new Date(Date.UTC(targetYear, mIndex, 1, 0, 0, 0, 0));
+}
+
 // ----------------- CRYPTO & PASSWORD HELPERS -----------------
 
 export function hashPassword(plainText: string, salt?: string) {
@@ -819,19 +938,16 @@ export async function resetFailedRecovery(userId: string) {
 
 // ----------------- CHIT MONTH RULES & CALCULATIONS -----------------
 
-export function computeChitCurrentMonth(startMonth: string, totalMonths: number): number {
-  if (!startMonth) return 1;
+export function computeChitCurrentMonth(startMonthStr: string, totalMonths: number): number {
+  if (!totalMonths || totalMonths < 1) return 1;
+  const start = parseYearMonthHelper(startMonthStr);
+  if (!start) return 1;
+
   const now = new Date();
-  const [startYearStr, startMonthStr] = startMonth.split('-');
-  const sYear = parseInt(startYearStr, 10);
-  const sMonth = parseInt(startMonthStr, 10);
-
-  if (isNaN(sYear) || isNaN(sMonth)) return 1;
-
   const currentYear = now.getFullYear();
   const currentMonthNum = now.getMonth() + 1;
 
-  const diffMonths = (currentYear - sYear) * 12 + (currentMonthNum - sMonth);
+  const diffMonths = (currentYear - start.year) * 12 + (currentMonthNum - start.month);
   const calculatedMonth = diffMonths + 1;
 
   if (calculatedMonth < 1) return 1;
@@ -2229,9 +2345,40 @@ export async function saveLiftAuction(chitId: string, memberId: string, body: an
     where: { memberId },
   });
 
+  const chit = await prisma.chit.findUnique({ where: { id: chitId } });
   const id = existingMemberLift ? existingMemberLift.id : ('lift-' + chitId + '-' + memberId);
   const now = new Date();
-  const liftDateObj = new Date(lift_date);
+
+  const rawDate = body.lift_date;
+  let liftDateObj: Date;
+  let shouldUpdateDate = false;
+
+  if (existingMemberLift) {
+    // UPDATE MODE: if date was not changed or sent empty, strictly preserve existing database liftDate
+    if (rawDate === undefined || rawDate === null || String(rawDate).trim() === '') {
+      shouldUpdateDate = false;
+      const preserved = parseDateOnly(existingMemberLift.liftDate);
+      liftDateObj = preserved || getDefaultLiftDateObj(chit?.startMonth, parsedMonth);
+    } else {
+      const parsed = parseDateOnly(rawDate);
+      if (!parsed) {
+        throw new Error(`Invalid lift date: "${rawDate}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+      }
+      liftDateObj = parsed;
+      shouldUpdateDate = true;
+    }
+  } else {
+    // NEW LIFT MODE: validate supplied date, or default safely from historical chit start month
+    if (rawDate === undefined || rawDate === null || String(rawDate).trim() === '') {
+      liftDateObj = getDefaultLiftDateObj(chit?.startMonth, parsedMonth);
+    } else {
+      const parsed = parseDateOnly(rawDate);
+      if (!parsed) {
+        throw new Error(`Invalid lift date: "${rawDate}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+      }
+      liftDateObj = parsed;
+    }
+  }
 
   const updatedLift = await prisma.$transaction(async (tx) => {
     if (existingMemberLift) {
@@ -2265,21 +2412,26 @@ export async function saveLiftAuction(chitId: string, memberId: string, body: an
       const remaining = Math.max(0, configuredPayout - finalPaid);
       const payoutStatus = remaining <= 0 ? 'PAID' : 'PARTIAL';
 
+      const updateData: any = {
+        liftMonth: parsedMonth,
+        liftAmount: configuredPayout,
+        liftAmountReceived: finalPaid,
+        remainingPayout: remaining,
+        payoutStatus,
+        paymentMethod: payment_method || 'Cash',
+        referenceNumber: reference_number || null,
+        notes: notes || null,
+        status: 'Completed',
+        updatedAt: now,
+      };
+
+      if (shouldUpdateDate && liftDateObj) {
+        updateData.liftDate = liftDateObj;
+      }
+
       await tx.liftDetail.update({
         where: { id },
-        data: {
-          liftMonth: parsedMonth,
-          liftAmount: configuredPayout,
-          liftAmountReceived: finalPaid,
-          remainingPayout: remaining,
-          payoutStatus,
-          liftDate: liftDateObj,
-          paymentMethod: payment_method || 'Cash',
-          referenceNumber: reference_number || null,
-          notes: notes || null,
-          status: 'Completed',
-          updatedAt: now,
-        },
+        data: updateData,
       });
     } else {
       const remaining = Math.max(0, configuredPayout - initialPaid);
@@ -2398,7 +2550,16 @@ export async function recordLiftPayoutPayment(chitId: string, memberId: string, 
 
   const now = new Date();
   const txId = 'tx-payout-' + lift.id + '-' + Date.now();
-  const payDateObj = payment_date ? new Date(payment_date) : now;
+  let payDateObj: Date;
+  if (payment_date === undefined || payment_date === null || String(payment_date).trim() === '') {
+    payDateObj = parseDateOnly(lift.liftDate) || now;
+  } else {
+    const parsed = parseDateOnly(payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    payDateObj = parsed;
+  }
 
   return await prisma.$transaction(async (tx) => {
     await tx.liftPayoutTransaction.create({
@@ -2496,7 +2657,16 @@ export async function createPaymentRecord(body: any) {
 
   const paymentId = 'pay-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const now = new Date();
-  const payDateObj = payment_date ? new Date(payment_date) : now;
+  let payDateObj: Date;
+  if (payment_date === undefined || payment_date === null || String(payment_date).trim() === '') {
+    payDateObj = now;
+  } else {
+    const parsed = parseDateOnly(payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    payDateObj = parsed;
+  }
 
   return await prisma.$transaction(async (tx) => {
     const payment = await tx.payment.create({
@@ -2632,20 +2802,37 @@ export async function updatePaymentRecord(id: string, body: any) {
   const newMethod = body.payment_method || payment.paymentMethod || 'Cash';
   const newRef = body.reference_no !== undefined ? body.reference_no : payment.referenceNo;
   const newNotes = body.notes !== undefined ? body.notes : payment.notes;
-  const newDate = body.payment_date ? new Date(body.payment_date) : payment.paymentDate;
   const now = new Date();
+  let newDate: Date;
+  let shouldUpdatePaymentDate = false;
+  if (body.payment_date === undefined || body.payment_date === null || String(body.payment_date).trim() === '') {
+    newDate = parseDateOnly(payment.paymentDate) || now;
+    shouldUpdatePaymentDate = false;
+  } else {
+    const parsed = parseDateOnly(body.payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${body.payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    newDate = parsed;
+    shouldUpdatePaymentDate = true;
+  }
 
   return await prisma.$transaction(async (tx) => {
+    const paymentUpdateData: any = {
+      amount: newAmount,
+      paymentMethod: newMethod,
+      referenceNo: newRef,
+      notes: newNotes,
+      updatedAt: now,
+    };
+
+    if (shouldUpdatePaymentDate && newDate) {
+      paymentUpdateData.paymentDate = newDate;
+    }
+
     const updatedPayment = await tx.payment.update({
       where: { id },
-      data: {
-        amount: newAmount,
-        paymentMethod: newMethod,
-        referenceNo: newRef,
-        notes: newNotes,
-        paymentDate: newDate,
-        updatedAt: now,
-      },
+      data: paymentUpdateData,
     });
 
     const postAgg = await tx.payment.aggregate({

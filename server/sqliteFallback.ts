@@ -808,6 +808,100 @@ export function fallbackGetMemberProfile(memberId: string) {
   };
 }
 
+/**
+ * Safe date-only parser for SQLite fallback operations
+ */
+export function parseDateOnly(input: string | Date | null | undefined): Date | null {
+  if (input === null || input === undefined) return null;
+
+  if (input instanceof Date || Object.prototype.toString.call(input) === '[object Date]') {
+    const d = input as Date;
+    if (isNaN(d.getTime())) return null;
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+  }
+
+  const str = String(input).trim();
+  if (!str || str.toLowerCase() === 'invalid date' || str === 'null' || str === 'undefined' || str === '-') {
+    return null;
+  }
+
+  let year: number | null = null;
+  let month: number | null = null;
+  let day: number | null = null;
+
+  const dmyMatch = /^(\d{1,2})[-./](\d{1,2})[-./](\d{4})$/.exec(str);
+  if (dmyMatch) {
+    day = parseInt(dmyMatch[1], 10);
+    month = parseInt(dmyMatch[2], 10);
+    year = parseInt(dmyMatch[3], 10);
+  } else {
+    const isoMatch = /^(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[T\s].*)?$/.exec(str);
+    if (isoMatch) {
+      year = parseInt(isoMatch[1], 10);
+      month = parseInt(isoMatch[2], 10);
+      day = parseInt(isoMatch[3], 10);
+    } else {
+      const fallback = new Date(str);
+      if (isNaN(fallback.getTime())) return null;
+      year = fallback.getUTCFullYear();
+      month = fallback.getUTCMonth() + 1;
+      day = fallback.getUTCDate();
+    }
+  }
+
+  if (year === null || month === null || day === null) return null;
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return null;
+  if (year < 1900 || year > 2100) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return null;
+
+  return new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+}
+
+export function formatDateOnly(date: Date | string | null | undefined): string {
+  const parsed = parseDateOnly(date);
+  if (!parsed) return '';
+  const d = String(parsed.getUTCDate()).padStart(2, '0');
+  const m = String(parsed.getUTCMonth() + 1).padStart(2, '0');
+  const y = parsed.getUTCFullYear();
+  return `${d}-${m}-${y}`;
+}
+
+export function getDefaultLiftDateObj(startMonthStr: string | null | undefined, liftMonthNumber: number = 1): Date {
+  const MONTHS_LIST = [
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december'
+  ];
+  if (!startMonthStr) {
+    const now = new Date();
+    return new Date(Date.UTC(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0));
+  }
+  const s = startMonthStr.trim().toLowerCase();
+  let year = new Date().getFullYear();
+  let month = 1;
+
+  const nameMatch = s.match(/([a-z]+)[\s,]+(\d{4})/i);
+  if (nameMatch) {
+    const mIdx = MONTHS_LIST.findIndex(m => m.startsWith(nameMatch[1].toLowerCase().substring(0, 3)));
+    if (mIdx !== -1) month = mIdx + 1;
+    year = parseInt(nameMatch[2], 10);
+  } else {
+    const isoMatch = s.match(/^(\d{4})[-\/](\d{1,2})$/);
+    if (isoMatch) {
+      year = parseInt(isoMatch[1], 10);
+      month = parseInt(isoMatch[2], 10);
+    }
+  }
+
+  const targetIndex = (month - 1) + (Math.max(1, liftMonthNumber) - 1);
+  const mIndex = ((targetIndex % 12) + 12) % 12;
+  const targetYear = year + Math.floor(targetIndex / 12);
+  return new Date(Date.UTC(targetYear, mIndex, 1, 0, 0, 0, 0));
+}
+
 export function fallbackSaveLiftAuction(chitId: string, memberId: string, body: any) {
   const { lift_month, lift_date, payment_method, reference_number, notes } = body;
   const parsedMonth = Number(lift_month);
@@ -832,7 +926,36 @@ export function fallbackSaveLiftAuction(chitId: string, memberId: string, body: 
   const existingMemberLift = db.prepare('SELECT * FROM lift_details WHERE member_id = ?').get(memberId) as any;
   const id = existingMemberLift ? existingMemberLift.id : ('lift-' + chitId + '-' + memberId);
   const now = new Date().toISOString();
-  const dateValue = String(lift_date).trim();
+
+  const rawDate = body.lift_date;
+  let dateValue: string;
+
+  if (existingMemberLift) {
+    // UPDATE MODE: if date was not changed or sent empty, strictly preserve existing database liftDate
+    if (rawDate === undefined || rawDate === null || String(rawDate).trim() === '') {
+      dateValue = existingMemberLift.lift_date;
+    } else {
+      const parsed = parseDateOnly(rawDate);
+      if (!parsed) {
+        throw new Error(`Invalid lift date: "${rawDate}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+      }
+      dateValue = formatDateOnly(parsed);
+    }
+  } else {
+    // NEW LIFT MODE: validate supplied date, or default safely from historical chit start month
+    if (rawDate === undefined || rawDate === null || String(rawDate).trim() === '') {
+      const chit = db.prepare('SELECT * FROM chits WHERE id = ?').get(chitId) as any;
+      const defObj = getDefaultLiftDateObj(chit?.start_month, parsedMonth);
+      dateValue = formatDateOnly(defObj);
+    } else {
+      const parsed = parseDateOnly(rawDate);
+      if (!parsed) {
+        throw new Error(`Invalid lift date: "${rawDate}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+      }
+      dateValue = formatDateOnly(parsed);
+    }
+  }
+
   const methodValue = String(payment_method).trim();
   const refValue = reference_number ? String(reference_number).trim() : null;
   const notesValue = notes ? String(notes).trim() : '';
@@ -923,7 +1046,16 @@ export function fallbackRecordLiftPayoutPayment(chitId: string, memberId: string
 
   const now = new Date().toISOString();
   const txId = 'tx-payout-' + lift.id + '-' + Date.now();
-  const dateValue = payment_date ? String(payment_date).trim() : new Date().toISOString().split('T')[0];
+  let dateValue: string;
+  if (payment_date === undefined || payment_date === null || String(payment_date).trim() === '') {
+    dateValue = lift.lift_date || formatDateOnly(now);
+  } else {
+    const parsed = parseDateOnly(payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    dateValue = formatDateOnly(parsed);
+  }
   const methodValue = payment_method ? String(payment_method).trim() : 'Cash';
   const refValue = reference_number ? String(reference_number).trim() : null;
   const notesValue = notes ? String(notes).trim() : null;
@@ -975,7 +1107,16 @@ export function fallbackCreatePaymentRecord(body: any) {
 
   const paymentId = 'pay-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
   const now = new Date().toISOString();
-  const payDate = payment_date || now;
+  let payDate: string;
+  if (payment_date === undefined || payment_date === null || String(payment_date).trim() === '') {
+    payDate = now;
+  } else {
+    const parsed = parseDateOnly(payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    payDate = formatDateOnly(parsed);
+  }
 
   const tx = db.transaction(() => {
     db.prepare(`
@@ -1066,7 +1207,16 @@ export function fallbackUpdatePaymentRecord(id: string, body: any) {
   const newMethod = payment_method || payment.payment_method || 'Cash';
   const newRef = reference_no !== undefined ? reference_no : payment.reference_no;
   const newNotes = notes !== undefined ? notes : payment.notes;
-  const newDate = payment_date || payment.payment_date;
+  let newDate: string;
+  if (payment_date === undefined || payment_date === null || String(payment_date).trim() === '') {
+    newDate = payment.payment_date;
+  } else {
+    const parsed = parseDateOnly(payment_date);
+    if (!parsed) {
+      throw new Error(`Invalid payment date: "${payment_date}". Please provide a valid date in DD-MM-YYYY or YYYY-MM-DD format.`);
+    }
+    newDate = formatDateOnly(parsed);
+  }
   const now = new Date().toISOString();
 
   const tx = db.transaction(() => {

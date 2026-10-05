@@ -11,7 +11,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { MonthlyDue, Payment, PaymentMethod } from '../types';
-import { formatINR, formatDateTime } from '../utils/formatters';
+import { formatINR, formatDateTime, toISODateInput } from '../utils/formatters';
 import { api } from '../services/api';
 
 interface EditPaymentModalProps {
@@ -76,7 +76,7 @@ export const EditPaymentModal: React.FC<EditPaymentModalProps> = ({
     setReferenceNo(payment.reference_no || '');
     setNotes(payment.notes || '');
     setPaymentDate(
-      payment.payment_date ? payment.payment_date.split('T')[0] : new Date().toISOString().split('T')[0]
+      payment.payment_date ? toISODateInput(payment.payment_date) : ''
     );
     setConfirmDelete(false);
     setError(null);

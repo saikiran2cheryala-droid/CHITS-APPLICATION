@@ -16,7 +16,7 @@ import {
   TrendingDown,
 } from 'lucide-react';
 import { Member, Chit, LiftPayoutTransaction, PaymentMethod } from '../types';
-import { formatINR, formatDDMMYYYY, formatDateTime } from '../utils/formatters';
+import { formatINR, formatDDMMYYYY, formatDateTime, toISODateInput, getDefaultLiftDate } from '../utils/formatters';
 import { api } from '../services/api';
 
 interface LiftDetailsModalProps {
@@ -120,7 +120,10 @@ export const LiftDetailsModal: React.FC<LiftDetailsModalProps> = ({
 
   const handleOpenReceivePayout = () => {
     setPayoutAmount(remainingPayout > 0 ? remainingPayout : '');
-    setPayoutDate(new Date().toISOString().split('T')[0]);
+    const defaultPayDate = currentMember.lift_date
+      ? toISODateInput(currentMember.lift_date)
+      : getDefaultLiftDate(chit?.start_month, currentMember.lift_month || 1);
+    setPayoutDate(defaultPayDate);
     setPayoutMethod('Bank Transfer');
     setPayoutReference('');
     setPayoutNotes('');

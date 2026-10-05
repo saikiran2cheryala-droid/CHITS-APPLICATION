@@ -120,95 +120,144 @@ export function getMonthLabel(startMonthStr: string, monthNumber: number): strin
 }
 
 /**
+ * Safe date-only parser that strictly handles:
+ * - DD-MM-YYYY (e.g. "22-08-2026", "01-08-2024")
+ * - DD/MM/YYYY (e.g. "22/08/2026", "01/08/2024")
+ * - YYYY-MM-DD (e.g. "2024-08-01", "2026-08-22")
+ * - ISO-8601 strings (e.g. "2026-08-22T00:00:00.000Z")
+ * - Valid Date objects
+ * 
+ * Never returns "Invalid Date". Returns null for invalid or empty inputs.
+ * Avoids any timezone-related date shifting by using UTC midnight representation.
+ */
+export function parseDateOnly(input: string | Date | null | undefined): Date | null {
+  if (input === null || input === undefined) return null;
+
+  if (input instanceof Date || Object.prototype.toString.call(input) === '[object Date]') {
+    const d = input as Date;
+    if (isNaN(d.getTime())) return null;
+    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0, 0));
+  }
+
+  const str = String(input).trim();
+  if (!str || str.toLowerCase() === 'invalid date' || str === 'null' || str === 'undefined' || str === '-') {
+    return null;
+  }
+
+  let year: number | null = null;
+  let month: number | null = null; // 1-12
+  let day: number | null = null;
+
+  // 1. DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY (e.g. "22-08-2026", "01-08-2024", "1-8-2024", "22.08.2026", "22/08/2026")
+  const dmyMatch = /^(\d{1,2})[-./](\d{1,2})[-./](\d{4})$/.exec(str);
+  if (dmyMatch) {
+    day = parseInt(dmyMatch[1], 10);
+    month = parseInt(dmyMatch[2], 10);
+    year = parseInt(dmyMatch[3], 10);
+  } else {
+    // 2. YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss (e.g. "2024-08-01", "2026-08-22T00:00:00.000Z", "2025/01/15")
+    const isoMatch = /^(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?:[T\s].*)?$/.exec(str);
+    if (isoMatch) {
+      year = parseInt(isoMatch[1], 10);
+      month = parseInt(isoMatch[2], 10);
+      day = parseInt(isoMatch[3], 10);
+    } else {
+      // Fallback: try Date constructor only if valid
+      const fallback = new Date(str);
+      if (isNaN(fallback.getTime())) return null;
+      year = fallback.getUTCFullYear();
+      month = fallback.getUTCMonth() + 1;
+      day = fallback.getUTCDate();
+    }
+  }
+
+  if (year === null || month === null || day === null) return null;
+  if (isNaN(year) || isNaN(month) || isNaN(day)) return null;
+  if (year < 1900 || year > 2100) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+
+  // Validate exact days in month (handles leap years correctly)
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return null;
+
+  return new Date(Date.UTC(year, month - 1, day, 0, 0, 0, 0));
+}
+
+/**
+ * Calculates default lift date from historical chit start month & lift month number
+ * e.g. startMonth = "August 2024", liftMonth = 1 -> "2024-08-01"
+ * e.g. startMonth = "August 2024", liftMonth = 2 -> "2024-09-01"
+ */
+export function getDefaultLiftDate(startMonthStr: string | null | undefined, liftMonthNumber: number = 1): string {
+  if (!startMonthStr) {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    return `${y}-${m}-01`;
+  }
+  const { monthIndex, year } = parseMonthString(startMonthStr);
+  const targetIndex = monthIndex + (Math.max(1, liftMonthNumber) - 1);
+  const mIndex = ((targetIndex % 12) + 12) % 12;
+  const targetYear = year + Math.floor(targetIndex / 12);
+  const mStr = String(mIndex + 1).padStart(2, '0');
+  return `${targetYear}-${mStr}-01`;
+}
+
+/**
  * Format timestamp into standard Indian date & time display
  */
 export function formatDateTime(isoString: string | null | undefined): string {
   if (!isoString) return '-';
+  const parsed = parseDateOnly(isoString);
+  if (!parsed) return String(isoString);
   try {
-    const date = new Date(isoString);
-    if (isNaN(date.getTime())) return isoString;
-    return date.toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: true
-    });
+    const d = String(parsed.getUTCDate()).padStart(2, '0');
+    const m = MONTH_NAMES[parsed.getUTCMonth()].substring(0, 3);
+    const y = parsed.getUTCFullYear();
+    return `${d} ${m} ${y}`;
   } catch {
-    return isoString;
+    return String(isoString);
   }
 }
 
 /**
- * Format date only (e.g. 15 Jan 2026)
+ * Format date only without timezone shift (e.g. 15 Jan 2026, 01 Aug 2024)
  */
 export function formatDate(isoString: string | null | undefined): string {
   if (!isoString) return '-';
-  try {
-    const date = new Date(isoString);
-    if (isNaN(date.getTime())) return isoString;
-    return date.toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric'
-    });
-  } catch {
-    return isoString;
-  }
+  const parsed = parseDateOnly(isoString);
+  if (!parsed) return String(isoString);
+  const d = String(parsed.getUTCDate()).padStart(2, '0');
+  const m = MONTH_NAMES[parsed.getUTCMonth()].substring(0, 3);
+  const y = parsed.getUTCFullYear();
+  return `${d} ${m} ${y}`;
 }
 
 /**
- * Format date strictly as DD/MM/YYYY (e.g. 15/04/2026)
+ * Format date strictly as DD-MM-YYYY (e.g. 22-08-2026, 01-08-2024)
  */
 export function formatDDMMYYYY(dateInput: string | Date | null | undefined): string {
   if (!dateInput) return '-';
-  if (typeof dateInput === 'string') {
-    const trimmed = dateInput.trim();
-    // If already DD/MM/YYYY
-    if (/^\d{2}\/\d{2}\/\d{4}$/.test(trimmed)) {
-      return trimmed;
-    }
-    // If YYYY-MM-DD
-    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
-      const [y, m, d] = trimmed.split('T')[0].split('-');
-      return `${d.padStart(2, '0')}/${m.padStart(2, '0')}/${y}`;
-    }
-  }
-  try {
-    const d = new Date(dateInput);
-    if (isNaN(d.getTime())) return String(dateInput);
-    const day = String(d.getDate()).padStart(2, '0');
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const year = d.getFullYear();
-    return `${day}/${month}/${year}`;
-  } catch {
-    return String(dateInput);
-  }
+  const parsed = parseDateOnly(dateInput);
+  if (!parsed) return typeof dateInput === 'string' ? dateInput : '-';
+  const day = String(parsed.getUTCDate()).padStart(2, '0');
+  const month = String(parsed.getUTCMonth() + 1).padStart(2, '0');
+  const year = parsed.getUTCFullYear();
+  return `${day}-${month}-${year}`;
 }
 
 /**
  * Convert any date string to YYYY-MM-DD for HTML <input type="date">
+ * Never replaces with today's date if invalid or empty.
  */
-export function toISODateInput(val: string | null | undefined): string {
-  if (!val) {
-    const today = new Date();
-    return today.toISOString().split('T')[0];
-  }
-  const trimmed = val.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return trimmed;
-  }
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(trimmed)) {
-    const [d, m, y] = trimmed.split('/');
-    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-  }
-  try {
-    const parsed = new Date(trimmed);
-    if (!isNaN(parsed.getTime())) {
-      return parsed.toISOString().split('T')[0];
-    }
-  } catch {}
-  return new Date().toISOString().split('T')[0];
+export function toISODateInput(val: string | Date | null | undefined): string {
+  if (!val) return '';
+  const parsed = parseDateOnly(val);
+  if (!parsed) return '';
+  const y = parsed.getUTCFullYear();
+  const m = String(parsed.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(parsed.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 

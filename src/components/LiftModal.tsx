@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, AlertCircle, Calendar, CreditCard, FileText, Hash, CheckCircle2, Clock, Award } from 'lucide-react';
 import { Chit, Member, ChitMonthRule, PaymentMethod } from '../types';
-import { formatDDMMYYYY, toISODateInput, formatINR } from '../utils/formatters';
+import { formatDDMMYYYY, toISODateInput, formatINR, getDefaultLiftDate } from '../utils/formatters';
 
 interface LiftModalProps {
   chit?: Chit | null;
@@ -56,7 +56,13 @@ export const LiftModal: React.FC<LiftModalProps> = ({
   const [liftMonth, setLiftMonth] = useState<number | ''>('');
   const [configuredPayout, setConfiguredPayout] = useState<number | string>('');
   const [initialAmountPaid, setInitialAmountPaid] = useState<number | string>('');
-  const [liftDate, setLiftDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [liftDate, setLiftDate] = useState<string>(() => {
+    if (selectedMemberId) {
+      const target = members.find((m) => m.id === selectedMemberId);
+      if (target?.lift_date) return toISODateInput(target.lift_date);
+    }
+    return getDefaultLiftDate(chit?.start_month, defaultMonth || 1);
+  });
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod | string>('Cash');
   const [referenceNumber, setReferenceNumber] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
@@ -91,7 +97,8 @@ export const LiftModal: React.FC<LiftModalProps> = ({
       if (selectedMember.lift_date) {
         setLiftDate(toISODateInput(selectedMember.lift_date));
       } else {
-        setLiftDate(new Date().toISOString().split('T')[0]);
+        const m = selectedMember.lift_month || defaultMonth || 1;
+        setLiftDate(getDefaultLiftDate(chit?.start_month, m));
       }
       const existingMethod = selectedMember.payment_method || selectedMember.lift_payment_method || 'Cash';
       setPaymentMethod(existingMethod);
@@ -104,20 +111,21 @@ export const LiftModal: React.FC<LiftModalProps> = ({
       setLiftMonth('');
       setConfiguredPayout('');
       setInitialAmountPaid('');
-      setLiftDate(new Date().toISOString().split('T')[0]);
+      setLiftDate(getDefaultLiftDate(chit?.start_month, defaultMonth || 1));
       setPaymentMethod('Cash');
       setReferenceNumber('');
       setNotes('');
     }
-  }, [selectedMember, defaultMonth, rules, totalMonths, memberId, members, chit?.chit_value]);
+  }, [selectedMember, defaultMonth, rules, totalMonths, memberId, members, chit?.chit_value, chit?.start_month]);
 
-  // When lift month changes, automatically suggest configured payout from rules or chit value
+  // When lift month changes, automatically suggest configured payout and date from rules or chit value
   const handleMonthChange = (monthVal: string) => {
     if (monthVal === '') {
       setLiftMonth('');
       if (!isEditing) {
         setConfiguredPayout('');
         setInitialAmountPaid('');
+        setLiftDate(getDefaultLiftDate(chit?.start_month, defaultMonth || 1));
       }
     } else {
       const num = parseInt(monthVal, 10);
@@ -130,6 +138,9 @@ export const LiftModal: React.FC<LiftModalProps> = ({
       if (!isEditing || !configuredPayout) {
         setConfiguredPayout(defaultPayout);
         setInitialAmountPaid(defaultPayout);
+      }
+      if (!isEditing) {
+        setLiftDate(getDefaultLiftDate(chit?.start_month, num));
       }
     }
     setError(null);
