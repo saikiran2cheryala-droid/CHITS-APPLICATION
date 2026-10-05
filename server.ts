@@ -972,6 +972,13 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   if (hasPostgresConnection()) {
     console.log('[DATABASE] Connecting to PostgreSQL via Prisma...');
+    try {
+      const { execSync } = await import('child_process');
+      console.log('[DATABASE] Checking and applying any pending Prisma migrations...');
+      execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+    } catch (migErr: any) {
+      console.warn('[DATABASE] Note on migration deploy:', migErr.message || migErr);
+    }
     await initPostgresDatabase();
     await syncChitsCurrentMonth();
     console.log('[DATABASE] PostgreSQL initialized and synchronized successfully.');
