@@ -123,4 +123,22 @@ describe('Password Recovery & OTP Flow', () => {
       'Reusing the same resetToken must throw'
     );
   });
+
+  it('8. Tests sendPasswordRecoveryEmail with Resend HTTPS API interface', async () => {
+    const { sendPasswordRecoveryEmail } = await import('../server/email');
+
+    // Without RESEND_API_KEY in dev, it safely simulates dispatch
+    const result = await sendPasswordRecoveryEmail({
+      to: 'test@example.com',
+      name: 'Test Administrator',
+      loginId: 'admin',
+      recoveryCode: '123456',
+      resetLink: 'http://localhost:3000/#reset?token=xyz',
+      expiresInMinutes: 10,
+    });
+
+    assert.ok(result);
+    assert.equal(result.sent, true);
+    assert.ok(result.message);
+  });
 });

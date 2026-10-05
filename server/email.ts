@@ -1,7 +1,4 @@
-import nodemailer from 'nodemailer';
-import type { Transporter } from 'nodemailer';
-
-interface PasswordRecoveryEmailParams {
+export interface PasswordRecoveryEmailParams {
   to: string;
   name: string;
   loginId: string;
@@ -10,83 +7,19 @@ interface PasswordRecoveryEmailParams {
   expiresInMinutes?: number;
 }
 
-interface SendEmailResult {
+export interface SendEmailResult {
   sent: boolean;
   message: string;
+  id?: string;
   previewUrl?: string;
-  mode: 'smtp' | 'ethereal' | 'logged';
-}
-
-let transporter: Transporter | null = null;
-let isEthereal = false;
-
-async function getTransporter(): Promise<{ transport: Transporter; fromAddress: string; mode: 'smtp' | 'ethereal' | 'logged' } | null> {
-  const host = process.env.SMTP_HOST || (process.env.GMAIL_USER ? 'smtp.gmail.com' : '');
-  const port = parseInt(process.env.SMTP_PORT || '587', 10);
-  const user = process.env.SMTP_USER || process.env.GMAIL_USER || process.env.EMAIL_USER || '';
-  const pass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_PASS || process.env.EMAIL_PASS || '';
-  const secure = process.env.SMTP_SECURE === 'true' || port === 465;
-  const from = process.env.SMTP_FROM || (user ? `"SAIKIRAN CHITS" <${user}>` : '"SAIKIRAN CHITS" <noreply@saikiranchits.com>');
-
-  // 1. If explicit SMTP credentials are provided, use them
-  if (host && user && pass) {
-    if (!transporter || isEthereal) {
-      transporter = nodemailer.createTransport({
-        host,
-        port,
-        secure,
-        auth: { user, pass },
-      });
-      isEthereal = false;
-    }
-    return { transport: transporter, fromAddress: from, mode: 'smtp' };
-  }
-
-  // 2. If Resend / API key is provided
-  if (process.env.RESEND_API_KEY) {
-    if (!transporter) {
-      transporter = nodemailer.createTransport({
-        host: 'smtp.resend.com',
-        port: 465,
-        secure: true,
-        auth: {
-          user: 'resend',
-          pass: process.env.RESEND_API_KEY,
-        },
-      });
-      isEthereal = false;
-    }
-    return { transport: transporter, fromAddress: from, mode: 'smtp' };
-  }
-
-  // 3. Fallback: Create or reuse an Ethereal test account so real email transactions can be previewed
-  try {
-    if (!transporter) {
-      const testAccount = await nodemailer.createTestAccount();
-      transporter = nodemailer.createTransport({
-        host: testAccount.smtp.host,
-        port: testAccount.smtp.port,
-        secure: testAccount.smtp.secure,
-        auth: {
-          user: testAccount.user,
-          pass: testAccount.pass,
-        },
-      });
-      isEthereal = true;
-    }
-    return {
-      transport: transporter,
-      fromAddress: '"SAIKIRAN CHITS Password Recovery" <security@saikiranchits.com>',
-      mode: 'ethereal',
-    };
-  } catch (err) {
-    console.warn('Could not create Ethereal test mailer, falling back to simulated log delivery:', err);
-    return null;
-  }
+  mode: 'resend' | 'logged';
 }
 
 export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailParams): Promise<SendEmailResult> {
   const { to, name, loginId, recoveryCode, resetLink, expiresInMinutes = 10 } = params;
+
+  const apiKey = (process.env.RESEND_API_KEY || '').trim();
+  const fromEmail = (process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev').trim();
 
   console.log(`\n======================================================`);
   console.log(`📧 [PASSWORD RECOVERY] Preparing email for: ${to}`);
@@ -136,7 +69,7 @@ export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailPar
             ${recoveryCode}
           </div>
           <div style="font-size: 11px; color: #64748b; margin-top: 6px;">
-            Valid for the next ${expiresInMinutes} minutes
+            Valid for the next ${expiresInMinutes} minutes (single-use only)
           </div>
         </div>
 
@@ -172,47 +105,62 @@ export async function sendPasswordRecoveryEmail(params: PasswordRecoveryEmailPar
 </html>
 `;
 
-  try {
-    const mailer = await getTransporter();
-
-    if (mailer) {
-      const info = await mailer.transport.sendMail({
-        from: mailer.fromAddress,
-        to,
-        subject: `[SAIKIRAN CHITS] Password Recovery Code: ${recoveryCode}`,
-        text: `Hello ${name || 'User'},\n\nYour 6-digit password recovery code for Login ID ${loginId} is: ${recoveryCode}\n\nReset Link: ${resetLink}\n\nThis code will expire in ${expiresInMinutes} minutes.\nIf you did not request this, please ignore this email.`,
-        html: htmlContent,
-      });
-
-      let previewUrl: string | undefined;
-      if (mailer.mode === 'ethereal') {
-        previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
-        console.log(`🌐 [Ethereal Mail Preview URL]: ${previewUrl}`);
-      }
-
-      console.log(`✅ [PASSWORD RECOVERY] Email dispatched successfully to ${to} (Message ID: ${info.messageId})`);
-      return {
-        sent: true,
-        message: mailer.mode === 'smtp'
-          ? `Recovery email sent successfully to ${to}.`
-          : `Recovery email dispatched (Test environment: ${previewUrl || 'sent'}).`,
-        previewUrl,
-        mode: mailer.mode,
-      };
-    } else {
-      // Mail transport not available
-      return {
-        sent: true,
-        message: `Recovery code generated and dispatched for ${to}.`,
-        mode: 'logged',
-      };
+  // Fallback for local development when RESEND_API_KEY is not yet supplied
+  if (!apiKey) {
+    if (process.env.NODE_ENV === 'production') {
+      const err = new Error('RESEND_API_KEY environment variable is not configured.');
+      console.error('❌ [EMAIL DISPATCH ERROR]', err.message);
+      throw err;
     }
-  } catch (err: any) {
-    console.error('❌ [PASSWORD RECOVERY] Error sending email:', err);
+    console.warn('⚠️ [RESEND] RESEND_API_KEY is not configured. Email simulated for local development.');
     return {
-      sent: false,
-      message: `Failed to deliver email: ${err.message || 'SMTP delivery error'}.`,
+      sent: true,
+      message: `Recovery code generated and simulated for ${to} (RESEND_API_KEY not configured).`,
       mode: 'logged',
     };
   }
+
+  // Resend HTTPS API endpoint
+  const resendUrl = 'https://api.resend.com/emails';
+
+  const payload = {
+    from: fromEmail,
+    to: [to],
+    subject: 'Password Recovery Verification Code',
+    html: htmlContent,
+  };
+
+  const response = await fetch(resendUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    let rawError = '';
+    try {
+      const errJson = (await response.json()) as any;
+      rawError = errJson?.message || JSON.stringify(errJson);
+    } catch {
+      rawError = await response.text();
+    }
+
+    // Safely sanitize any accidental key leak from the error details
+    const sanitizedError = apiKey ? rawError.split(apiKey).join('[REDACTED_API_KEY]') : rawError;
+    console.error(`❌ [RESEND API ERROR] HTTP ${response.status}: ${sanitizedError}`);
+    throw new Error(`Resend email delivery failed (${response.status}): ${sanitizedError}`);
+  }
+
+  const result = (await response.json()) as any;
+  console.log(`✅ [PASSWORD RECOVERY] Email dispatched successfully to ${to} via Resend (ID: ${result?.id || 'unknown'})`);
+
+  return {
+    sent: true,
+    id: result?.id,
+    message: `Password recovery verification code sent successfully to ${to}.`,
+    mode: 'resend',
+  };
 }
