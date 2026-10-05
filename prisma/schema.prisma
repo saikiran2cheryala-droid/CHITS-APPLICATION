@@ -155,6 +155,7 @@ model LiftDetail {
 
   @@index([chitId])
   @@index([liftMonth])
+  @@unique([chitId, liftMonth])
   @@map("lift_details")
 }
 
