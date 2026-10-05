@@ -1389,61 +1389,80 @@ export async function createChitFull(body: any) {
       },
     });
 
-    for (const r of rules) {
-      await tx.chitMonthRule.create({
-        data: {
-          id: `rule-${chitId}-m${r.month_number}`,
-          chitId,
-          monthNumber: Number(r.month_number),
-          monthName: String(r.month_name),
-          preLiftPayment: Number(r.pre_lift_payment),
-          postLiftPayment: Number(r.post_lift_payment),
-          monthlyChitValue: Number(r.monthly_chit_value),
-          expectedLiftPayout: Number(r.expected_lift_payout),
-        },
+    const ruleRecords = (rules || []).map((r: any) => ({
+      id: `rule-${chitId}-m${r.month_number}`,
+      chitId,
+      monthNumber: Number(r.month_number),
+      monthName: String(r.month_name),
+      preLiftPayment: Number(r.pre_lift_payment),
+      postLiftPayment: Number(r.post_lift_payment),
+      monthlyChitValue: Number(r.monthly_chit_value),
+      expectedLiftPayout: Number(r.expected_lift_payout),
+    }));
+
+    if (ruleRecords.length > 0) {
+      await tx.chitMonthRule.createMany({
+        data: ruleRecords,
+        skipDuplicates: true,
       });
     }
 
-    for (let index = 0; index < members.length; index++) {
+    const memberRecords: any[] = [];
+    const dueRecords: any[] = [];
+
+    for (let index = 0; index < (members || []).length; index++) {
       const m = members[index];
       const memberId = `mem-${chitId}-${index + 1}-${Math.random().toString(36).substring(2, 6)}`;
       const ticket = m.ticket_number || String(index + 1).padStart(2, '0');
 
-      await tx.member.create({
-        data: {
-          id: memberId,
-          chitId,
-          customerName: String(m.customer_name).trim(),
-          phone: String(m.phone).trim(),
-          ticketNumber: ticket,
-          status: 'active',
-          joinDate: now,
-          createdAt: now,
-        },
+      memberRecords.push({
+        id: memberId,
+        chitId,
+        customerName: String(m.customer_name).trim(),
+        phone: String(m.phone).trim(),
+        ticketNumber: ticket,
+        status: 'active',
+        joinDate: now,
+        createdAt: now,
       });
 
-      for (const r of rules) {
+      for (const r of (rules || [])) {
         const dueId = `due-${chitId}-${memberId}-m${r.month_number}`;
         const preAmount = Number(r.pre_lift_payment);
-        await tx.monthlyDue.create({
-          data: {
-            id: dueId,
-            chitId,
-            memberId,
-            monthNumber: Number(r.month_number),
-            monthName: String(r.month_name),
-            dueAmount: preAmount,
-            paidAmount: 0,
-            balanceAmount: preAmount,
-            status: 'PENDING',
-            dueDate: now,
-            generatedAt: now,
-          },
+        dueRecords.push({
+          id: dueId,
+          chitId,
+          memberId,
+          monthNumber: Number(r.month_number),
+          monthName: String(r.month_name),
+          dueAmount: preAmount,
+          paidAmount: 0,
+          balanceAmount: preAmount,
+          status: 'PENDING',
+          dueDate: now,
+          generatedAt: now,
         });
       }
     }
 
+    if (memberRecords.length > 0) {
+      await tx.member.createMany({
+        data: memberRecords,
+        skipDuplicates: true,
+      });
+    }
+
+    if (dueRecords.length > 0) {
+      await tx.monthlyDue.createMany({
+        data: dueRecords,
+        skipDuplicates: true,
+      });
+    }
+
     return serializeChit(chit);
+  }, {
+    maxWait: 20000,
+    timeout: 60000,
   });
 }
 
@@ -1824,27 +1843,35 @@ export async function addMemberToChit(chitId: string, body: any) {
       },
     });
 
-    for (const r of chit.rules) {
+    const dueRecords = (chit.rules || []).map((r) => {
       const dueId = `due-${chitId}-${memberId}-m${r.monthNumber}`;
       const preAmount = toNumber(r.preLiftPayment);
-      await tx.monthlyDue.create({
-        data: {
-          id: dueId,
-          chitId,
-          memberId,
-          monthNumber: r.monthNumber,
-          monthName: r.monthName,
-          dueAmount: preAmount,
-          paidAmount: 0,
-          balanceAmount: preAmount,
-          status: 'PENDING',
-          dueDate: now,
-          generatedAt: now,
-        },
+      return {
+        id: dueId,
+        chitId,
+        memberId,
+        monthNumber: r.monthNumber,
+        monthName: r.monthName,
+        dueAmount: preAmount,
+        paidAmount: 0,
+        balanceAmount: preAmount,
+        status: 'PENDING',
+        dueDate: now,
+        generatedAt: now,
+      };
+    });
+
+    if (dueRecords.length > 0) {
+      await tx.monthlyDue.createMany({
+        data: dueRecords,
+        skipDuplicates: true,
       });
     }
 
     return serializeMember(member);
+  }, {
+    maxWait: 15000,
+    timeout: 30000,
   });
 }
 
@@ -1888,68 +1915,82 @@ export async function importMembersToChit(chitId: string, customers: any[]) {
   const now = new Date();
   const imported: any[] = [];
   const skipped: any[] = [];
+  const memberRecords: any[] = [];
+  const dueRecords: any[] = [];
 
-  await prisma.$transaction(async (tx) => {
-    for (let i = 0; i < customers.length; i++) {
-      const c = customers[i];
-      const rawName = String(c.customer_name || c.name || '').trim();
-      const rawPhone = String(c.phone || c.phone_number || '').trim();
-      const cleanPhone = rawPhone.replace(/\D/g, '');
+  for (let i = 0; i < customers.length; i++) {
+    const c = customers[i];
+    const rawName = String(c.customer_name || c.name || '').trim();
+    const rawPhone = String(c.phone || c.phone_number || '').trim();
+    const cleanPhone = rawPhone.replace(/\D/g, '');
 
-      if (!rawName || !rawPhone || cleanPhone.length < 10) {
-        skipped.push({ ...c, reason: 'Invalid name or phone number' });
-        continue;
-      }
+    if (!rawName || !rawPhone || cleanPhone.length < 10) {
+      skipped.push({ ...c, reason: 'Invalid name or phone number' });
+      continue;
+    }
 
-      if (imported.length >= remainingSlots) {
-        skipped.push({ ...c, customer_name: rawName, phone: rawPhone, reason: 'Chit member limit reached' });
-        continue;
-      }
+    if (imported.length >= remainingSlots) {
+      skipped.push({ ...c, customer_name: rawName, phone: rawPhone, reason: 'Chit member limit reached' });
+      continue;
+    }
 
-      maxTicket += 1;
-      const ticketNumber = c.ticket_number ? String(c.ticket_number).trim() : String(maxTicket);
-      const memberId = `mem-${chitId}-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`;
+    maxTicket += 1;
+    const ticketNumber = c.ticket_number ? String(c.ticket_number).trim() : String(maxTicket);
+    const memberId = `mem-${chitId}-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`;
 
-      await tx.member.create({
-        data: {
-          id: memberId,
-          chitId,
-          customerName: rawName,
-          phone: rawPhone,
-          ticketNumber,
-          status: 'active',
-          joinDate: now,
-          createdAt: now,
-        },
-      });
+    memberRecords.push({
+      id: memberId,
+      chitId,
+      customerName: rawName,
+      phone: rawPhone,
+      ticketNumber,
+      status: 'active',
+      joinDate: now,
+      createdAt: now,
+    });
 
-      for (const rule of chit.rules) {
-        const dueId = `due-${chitId}-${memberId}-m${rule.monthNumber}`;
-        const preAmount = toNumber(rule.preLiftPayment);
-        await tx.monthlyDue.create({
-          data: {
-            id: dueId,
-            chitId,
-            memberId,
-            monthNumber: rule.monthNumber,
-            monthName: rule.monthName,
-            dueAmount: preAmount,
-            paidAmount: 0,
-            balanceAmount: preAmount,
-            status: 'PENDING',
-            dueDate: now,
-            generatedAt: now,
-          },
-        });
-      }
-
-      imported.push({
-        id: memberId,
-        customer_name: rawName,
-        phone: rawPhone,
-        ticket_number: ticketNumber,
+    for (const rule of chit.rules) {
+      const dueId = `due-${chitId}-${memberId}-m${rule.monthNumber}`;
+      const preAmount = toNumber(rule.preLiftPayment);
+      dueRecords.push({
+        id: dueId,
+        chitId,
+        memberId,
+        monthNumber: rule.monthNumber,
+        monthName: rule.monthName,
+        dueAmount: preAmount,
+        paidAmount: 0,
+        balanceAmount: preAmount,
+        status: 'PENDING',
+        dueDate: now,
+        generatedAt: now,
       });
     }
+
+    imported.push({
+      id: memberId,
+      customer_name: rawName,
+      phone: rawPhone,
+      ticket_number: ticketNumber,
+    });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    if (memberRecords.length > 0) {
+      await tx.member.createMany({
+        data: memberRecords,
+        skipDuplicates: true,
+      });
+    }
+    if (dueRecords.length > 0) {
+      await tx.monthlyDue.createMany({
+        data: dueRecords,
+        skipDuplicates: true,
+      });
+    }
+  }, {
+    maxWait: 20000,
+    timeout: 60000,
   });
 
   return {
